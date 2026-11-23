@@ -316,6 +316,18 @@ static LocationEngineRequest toLocationEngineRequest(Object o) {
     if (zoomGesturesEnabled != null) {
       sink.setZoomGesturesEnabled(toBoolean(zoomGesturesEnabled));
     }
+    final Object doubleClickZoomEnabled = data.get("doubleClickZoomEnabled");
+    if (doubleClickZoomEnabled != null) {
+      sink.setDoubleClickZoomEnabled(toBoolean(doubleClickZoomEnabled));
+    }
+    final Object foregroundLoadColor = data.get("foregroundLoadColor");
+    if (foregroundLoadColor != null) {
+      sink.setForegroundLoadColor(toInt(foregroundLoadColor));
+    }
+    final Object translucentTextureSurface = data.get("translucentTextureSurface");
+    if (translucentTextureSurface != null) {
+      sink.setTranslucentTextureSurface(toBoolean(translucentTextureSurface));
+    }
     final Object myLocationEnabled = data.get("myLocationEnabled");
     if (myLocationEnabled != null) {
       sink.setMyLocationEnabled(toBoolean(myLocationEnabled));

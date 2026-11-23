@@ -30,6 +30,7 @@ import androidx.annotation.NonNull;
 import androidx.lifecycle.DefaultLifecycleObserver;
 import androidx.lifecycle.Lifecycle;
 import androidx.lifecycle.LifecycleOwner;
+
 import com.google.gson.Gson;
 import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
@@ -38,11 +39,16 @@ import com.google.gson.JsonParser;
 //import com.mapbox.geojson.FeatureCollection;
 import vn.vietmap.android.gestures.AndroidGesturesManager;
 import vn.vietmap.android.gestures.MoveGestureDetector;
+
 import com.mapbox.geojson.Feature;
 import com.mapbox.geojson.FeatureCollection;
 
+import java.io.ByteArrayOutputStream;
+
 import vn.vietmap.vietmapsdk.constants.VietMapConstants;
 import vn.vietmap.vietmapsdk.geometry.LatLngQuad;
+import vn.vietmap.vietmapsdk.snapshotter.MapSnapshot;
+import vn.vietmap.vietmapsdk.snapshotter.MapSnapshotter;
 import vn.vietmap.vietmapsdk.geometry.VisibleRegion;
 import vn.vietmap.vietmapsdk.location.LocationComponent;
 import vn.vietmap.vietmapsdk.location.LocationComponentActivationOptions;
@@ -103,10 +109,12 @@ import java.util.Map;
 import java.util.Set;
 
 
-/** Controller of a single VietMapGL MapView instance. */
+/**
+ * Controller of a single VietMapGL MapView instance.
+ */
 @SuppressLint("MissingPermission")
 final class VietmapGLController
-    implements DefaultLifecycleObserver,
+        implements DefaultLifecycleObserver,
         VietMapGL.OnCameraIdleListener,
         VietMapGL.OnCameraMoveListener,
         VietMapGL.OnCameraMoveStartedListener,
@@ -119,211 +127,261 @@ final class VietmapGLController
         OnCameraTrackingChangedListener,
         MapView.OnCameraDidChangeListener,
         PlatformView {
-  private static final String TAG = "VietmapGLController";
-  private final int id;
-  private final MethodChannel methodChannel;
-  private final VietmapGLPlugin.LifecycleProvider lifecycleProvider;
-  private final float density;
-  private final Context context;
-  private String styleStringInitial;
-  /**
-   * This container is returned as the final platform view instead of returning `mapView`.
-   * See {@link VietmapGLController#destroyMapViewIfNecessary()} for details.
-   */
-  private ArrayList<MarkerLayerData> markerLayerData = new ArrayList<>();
-  private FrameLayout mapViewContainer;
-  private MapView mapView;
-  private VietMapGL vietmapGL;
-  private boolean trackCameraPosition = false;
-  private boolean myLocationEnabled = false;
-  private int myLocationTrackingMode = 0;
-  private int myLocationRenderMode = 0;
-  private boolean disposed = false;
-  private boolean dragEnabled = true;
-  private MethodChannel.Result mapReadyResult;
-  private LocationComponent locationComponent = null;
-  private LocationEngineCallback<LocationEngineResult> locationEngineCallback = null;
-  private Style style;
-  private Feature draggedFeature;
-  private AndroidGesturesManager androidGesturesManager;
-  private Boolean logoEnabled = true;
-  private LatLng dragOrigin;
-  private LatLng dragPrevious;
+    private static final String TAG = "VietmapGLController";
+    private final int id;
+    private final MethodChannel methodChannel;
+    private final VietmapGLPlugin.LifecycleProvider lifecycleProvider;
+    private final float density;
+    private final Context context;
+    private String styleStringInitial;
+    /**
+     * This container is returned as the final platform view instead of returning `mapView`.
+     * See {@link VietmapGLController#destroyMapViewIfNecessary()} for details.
+     */
+    private ArrayList<MarkerLayerData> markerLayerData = new ArrayList<>();
+    private FrameLayout mapViewContainer;
+    private MapView mapView;
+    private VietMapGL vietmapGL;
+    /**
+     * In-flight offscreen snapshotter, kept so a new request can cancel it.
+     */
+    private MapSnapshotter activeSnapshotter;
+    private boolean trackCameraPosition = false;
+    private boolean myLocationEnabled = false;
+    private int myLocationTrackingMode = 0;
+    private int myLocationRenderMode = 0;
+    private boolean disposed = false;
+    private boolean dragEnabled = true;
+    private MethodChannel.Result mapReadyResult;
+    private LocationComponent locationComponent = null;
+    private LocationEngineCallback<LocationEngineResult> locationEngineCallback = null;
+    private Style style;
+    private Feature draggedFeature;
+    private AndroidGesturesManager androidGesturesManager;
+    private Boolean logoEnabled = true;
+    private LatLng dragOrigin;
+    private LatLng dragPrevious;
 
-  private Set<String> interactiveFeatureLayerIds;
-  private Map<String, FeatureCollection> addedFeaturesByLayer;
+    private Set<String> interactiveFeatureLayerIds;
+    private Map<String, FeatureCollection> addedFeaturesByLayer;
 
-  private boolean isCustomizeLocationMarker = true;
-  private LatLngBounds bounds = null;
-  Style.OnStyleLoaded onStyleLoadedCallback =
-      new Style.OnStyleLoaded() {
-        @Override
-        public void onStyleLoaded(@NonNull Style style) {
-          VietmapGLController.this.style = style;
+    private boolean isCustomizeLocationMarker = true;
+    private LatLngBounds bounds = null;
+    // Incremented by every loadStyle() call, so only the latest style's callback runs.
+    private int styleLoadGeneration = 0;
+    Style.OnStyleLoaded onStyleLoadedCallback =
+            new Style.OnStyleLoaded() {
+                @Override
+                public void onStyleLoaded(@NonNull Style style) {
+                    VietmapGLController.this.style = style;
 
-          // commented out while cherry-picking upstream956
-          // if (myLocationEnabled) {
-          //   if (hasLocationPermission()) {
-          //     updateMyLocationEnabled();
-          //   }
-          // }
-          updateMyLocationEnabled();
+                    // An already-created location component still points at the
+                    // previous style's layers and sources. Re-activating it (which
+                    // is what these two do first) is the documented way to move it
+                    // onto the new style, and it also restores the camera / render
+                    // modes that the re-activation resets. The activation builds a
+                    // fresh location engine, so drop the listener registered on the
+                    // old one first and let updateMyLocationEnabled() re-register
+                    // it below.
+                    if (locationComponent != null) {
+                        stopListeningForLocationUpdates();
+                        updateMyLocationTrackingMode();
+                        updateMyLocationRenderMode();
+                    }
 
-          if (null != bounds) {
-            vietmapGL.setLatLngBoundsForCameraTarget(bounds);
-          }
-          vietmapGL.addOnMapClickListener(VietmapGLController.this);
-          vietmapGL.addOnMapLongClickListener(VietmapGLController.this);
-          methodChannel.invokeMethod("map#onStyleLoaded", null);
+                    // commented out while cherry-picking upstream956
+                    // if (myLocationEnabled) {
+                    //   if (hasLocationPermission()) {
+                    //     updateMyLocationEnabled();
+                    //   }
+                    // }
+                    updateMyLocationEnabled();
 
-          updateLogoEnabled();
+                    if (null != bounds) {
+                        vietmapGL.setLatLngBoundsForCameraTarget(bounds);
+                    }
+                    vietmapGL.addOnMapClickListener(VietmapGLController.this);
+                    vietmapGL.addOnMapLongClickListener(VietmapGLController.this);
+                    methodChannel.invokeMethod("map#onStyleLoaded", null);
+
+                    updateLogoEnabled();
+                }
+            };
+
+    VietmapGLController(
+            int id,
+            Context context,
+            BinaryMessenger messenger,
+            VietmapGLPlugin.LifecycleProvider lifecycleProvider,
+            VietMapGLOptions options,
+            String styleStringInitial,
+            boolean dragEnabled) {
+        VietmapUtils.getVietMapGL(context);
+        this.id = id;
+        this.context = context;
+        this.dragEnabled = dragEnabled;
+        this.styleStringInitial = styleStringInitial;
+        this.mapViewContainer = new FrameLayout(context);
+        this.mapView = new MapView(context, options);
+        this.interactiveFeatureLayerIds = new HashSet<>();
+        this.addedFeaturesByLayer = new HashMap<String, FeatureCollection>();
+        this.density = context.getResources().getDisplayMetrics().density;
+        this.lifecycleProvider = lifecycleProvider;
+        if (dragEnabled) {
+            this.androidGesturesManager = new AndroidGesturesManager(this.mapView.getContext(), false);
         }
-      };
 
-  VietmapGLController(
-      int id,
-      Context context,
-      BinaryMessenger messenger,
-      VietmapGLPlugin.LifecycleProvider lifecycleProvider,
-      VietMapGLOptions options,
-      String styleStringInitial,
-      boolean dragEnabled) {
-    VietmapUtils.getVietMapGL(context);
-    this.id = id;
-    this.context = context;
-    this.dragEnabled = dragEnabled;
-    this.styleStringInitial = styleStringInitial;
-    this.mapViewContainer = new FrameLayout(context);
-    this.mapView = new MapView(context, options);
-    this.interactiveFeatureLayerIds = new HashSet<>();
-    this.addedFeaturesByLayer = new HashMap<String, FeatureCollection>();
-    this.density = context.getResources().getDisplayMetrics().density;
-    this.lifecycleProvider = lifecycleProvider;
-    if (dragEnabled) {
-      this.androidGesturesManager = new AndroidGesturesManager(this.mapView.getContext(), false);
+        mapViewContainer.addView(mapView);
+        methodChannel = new MethodChannel(messenger, "plugins.flutter.io/maplibre_gl_" + id);
+        methodChannel.setMethodCallHandler(this);
     }
 
-    mapViewContainer.addView(mapView);
-    methodChannel = new MethodChannel(messenger, "plugins.flutter.io/maplibre_gl_" + id);
-    methodChannel.setMethodCallHandler(this);
-  }
-
-  @Override
-  public View getView() {
-    return mapViewContainer;
-  }
-
-  void init() {
-    lifecycleProvider.getLifecycle().addObserver(this);
-    mapView.getMapAsync(this);
-  }
-
-  private void moveCamera(CameraUpdate cameraUpdate) {
-    vietmapGL.moveCamera(cameraUpdate);
-  }
-
-  private void animateCamera(CameraUpdate cameraUpdate) {
-    vietmapGL.animateCamera(cameraUpdate);
-  }
-
-  private CameraPosition getCameraPosition() {
-    return trackCameraPosition ? vietmapGL.getCameraPosition() : null;
-  }
-
-  public void recenter() {
-      if (vietmapGL != null) {
-          CameraPosition cameraPosition = vietmapGL.getCameraPosition();
-          CameraPosition.Builder builder = new CameraPosition.Builder();
-          builder.target(cameraPosition.target);
-          builder.zoom(cameraPosition.zoom);
-          builder.tilt(cameraPosition.tilt);
-          builder.bearing(cameraPosition.bearing);
-          CameraPosition cameraPosition1 = builder.build();
-          CameraUpdate cameraUpdate = CameraUpdateFactory.newCameraPosition(cameraPosition1);
-          animateCamera(cameraUpdate);
-      }
-  }
-
-  @Override
-  public void onMapReady(VietMapGL vietMapGL) {
-    this.vietmapGL = vietMapGL;
-    if (mapReadyResult != null) {
-      mapReadyResult.success(null);
-      mapReadyResult = null;
-    }
-    vietMapGL.addOnCameraMoveStartedListener(this);
-    vietMapGL.addOnCameraMoveListener(this);
-    vietMapGL.addOnCameraIdleListener(this);
-
-    if (androidGesturesManager != null) {
-      androidGesturesManager.setMoveGestureListener(new MoveGestureListener());
-      mapView.setOnTouchListener(
-          new View.OnTouchListener() {
-            @Override
-            public boolean onTouch(View v, MotionEvent event) {
-              androidGesturesManager.onTouchEvent(event);
-
-              return draggedFeature != null;
-            }
-          });
+    @Override
+    public View getView() {
+        return mapViewContainer;
     }
 
-    mapView.addOnStyleImageMissingListener(
-        (id) -> {
-          DisplayMetrics displayMetrics = context.getResources().getDisplayMetrics();
-          final Bitmap bitmap = getScaledImage(id, displayMetrics.density);
-          if (bitmap != null) {
-            vietMapGL.getStyle().addImage(id, bitmap);
-          }
-        });
-
-    mapView.addOnDidFinishRenderingMapListener((rendered) ->
-            methodChannel.invokeMethod("map#onMapRendered", null));
-    mapView.addOnDidBecomeIdleListener(this);
-
-    mapView.addOnCameraDidChangeListener(this);
-
-    setStyleString(styleStringInitial);
-  }
-
-  @Override
-  public void setStyleString(@NonNull String styleString) {
-    // clear old layer id from the location Component
-    clearLocationComponentLayer();
-    styleString = styleString.trim();
-
-    // Check if json, url, absolute path or asset path:
-    if (styleString == null || styleString.equals("")) {
-      Log.e(TAG, "setStyleString - string empty or null");
-    } else if (styleString.startsWith("{") || styleString.startsWith("[")) {
-      vietmapGL.setStyle(new Style.Builder().fromJson(styleString), onStyleLoadedCallback);
-    } else if (styleString.startsWith("/")) {
-      // Absolute path
-      vietmapGL.setStyle(
-          new Style.Builder().fromUri("file://" + styleString), onStyleLoadedCallback);
-    } else if (!styleString.startsWith("http://")
-        && !styleString.startsWith("https://")
-        && !styleString.startsWith("mapbox://")) {
-      // We are assuming that the style will be loaded from an asset here.
-      String key = VietmapGLPlugin.flutterAssets.getAssetFilePathByName(styleString);
-      vietmapGL.setStyle(new Style.Builder().fromUri("asset://" + key), onStyleLoadedCallback);
-    } else {
-      vietmapGL.setStyle(new Style.Builder().fromUri(styleString), onStyleLoadedCallback);
+    void init() {
+        lifecycleProvider.getLifecycle().addObserver(this);
+        mapView.getMapAsync(this);
     }
-  }
 
-  private void customLocationComponentOptions(@NonNull Style style){
-    if(locationComponent == null || style==null) return;
-    LocationComponentActivationOptions.Builder options =
-            LocationComponentActivationOptions
-                    .builder(context, style);
+    private void moveCamera(CameraUpdate cameraUpdate) {
+        vietmapGL.moveCamera(cameraUpdate);
+    }
+
+    private void animateCamera(CameraUpdate cameraUpdate) {
+        vietmapGL.animateCamera(cameraUpdate);
+    }
+
+    private CameraPosition getCameraPosition() {
+        return trackCameraPosition ? vietmapGL.getCameraPosition() : null;
+    }
+
+    public void recenter() {
+        if (vietmapGL != null) {
+            CameraPosition cameraPosition = vietmapGL.getCameraPosition();
+            CameraPosition.Builder builder = new CameraPosition.Builder();
+            builder.target(cameraPosition.target);
+            builder.zoom(cameraPosition.zoom);
+            builder.tilt(cameraPosition.tilt);
+            builder.bearing(cameraPosition.bearing);
+            CameraPosition cameraPosition1 = builder.build();
+            CameraUpdate cameraUpdate = CameraUpdateFactory.newCameraPosition(cameraPosition1);
+            animateCamera(cameraUpdate);
+        }
+    }
+
+    @Override
+    public void onMapReady(VietMapGL vietMapGL) {
+        this.vietmapGL = vietMapGL;
+        if (mapReadyResult != null) {
+            mapReadyResult.success(null);
+            mapReadyResult = null;
+        }
+        vietMapGL.addOnCameraMoveStartedListener(this);
+        vietMapGL.addOnCameraMoveListener(this);
+        vietMapGL.addOnCameraIdleListener(this);
+
+        if (androidGesturesManager != null) {
+            androidGesturesManager.setMoveGestureListener(new MoveGestureListener());
+            mapView.setOnTouchListener(
+                    new View.OnTouchListener() {
+                        @Override
+                        public boolean onTouch(View v, MotionEvent event) {
+                            androidGesturesManager.onTouchEvent(event);
+
+                            return draggedFeature != null;
+                        }
+                    });
+        }
+
+        mapView.addOnStyleImageMissingListener(
+                (id) -> {
+                    DisplayMetrics displayMetrics = context.getResources().getDisplayMetrics();
+                    final Bitmap bitmap = getScaledImage(id, displayMetrics.density);
+                    if (bitmap != null) {
+                        vietMapGL.getStyle().addImage(id, bitmap);
+                    }
+                });
+
+        mapView.addOnDidFinishRenderingMapListener((rendered) ->
+                methodChannel.invokeMethod("map#onMapRendered", null));
+        mapView.addOnDidBecomeIdleListener(this);
+
+        mapView.addOnCameraDidChangeListener(this);
+
+        setStyleString(styleStringInitial);
+    }
+
+    @Override
+    public void setStyleString(@NonNull String styleString) {
+        // clear old layer id from the location Component
+        clearLocationComponentLayer();
+        styleString = styleString.trim();
+
+        // Prevent race conditions: invalidate current style reference & interactive
+        // layers. The old Style instance becomes invalid the moment setStyle is
+        // called, and every call that reaches it in the meantime throws
+        // "Calling <x> when a newer style is loading/has loaded".
+        this.style = null;
+        if (interactiveFeatureLayerIds != null) {
+            interactiveFeatureLayerIds.clear();
+        }
+
+        // Check if json, url, absolute path or asset path:
+        if (styleString == null || styleString.equals("")) {
+            Log.e(TAG, "setStyleString - string empty or null");
+        } else if (styleString.startsWith("{") || styleString.startsWith("[")) {
+            loadStyle(new Style.Builder().fromJson(styleString));
+        } else if (styleString.startsWith("/")) {
+            // Absolute path
+            loadStyle(new Style.Builder().fromUri("file://" + styleString));
+        } else if (!styleString.startsWith("http://")
+                && !styleString.startsWith("https://")
+                && !styleString.startsWith("mapbox://")) {
+            // We are assuming that the style will be loaded from an asset here.
+            String key = VietmapGLPlugin.flutterAssets.getAssetFilePathByName(styleString);
+            loadStyle(new Style.Builder().fromUri("asset://" + key));
+        } else {
+            loadStyle(new Style.Builder().fromUri(styleString));
+        }
+    }
+
+    /**
+     * Loads a style and runs {@link #onStyleLoadedCallback} once it has finished loading.
+     *
+     * <p>The callback is registered through {@code getStyle()} instead of being passed to
+     * {@code setStyle()}: the SDK drops a {@code setStyle()} callback as soon as the style
+     * request fails, even when its automatic retry loads the style a moment later, so the
+     * location component and {@code map#onStyleLoaded} were never set up. {@code getStyle()}
+     * callbacks stay queued until a style has finished loading, but a newer {@code setStyle()}
+     * does not replace them, so a callback queued for a style that has since been replaced
+     * is skipped.
+     */
+    private void loadStyle(@NonNull Style.Builder builder) {
+        final int generation = ++styleLoadGeneration;
+        vietmapGL.setStyle(builder);
+        vietmapGL.getStyle(
+                style -> {
+                    if (generation == styleLoadGeneration) {
+                        onStyleLoadedCallback.onStyleLoaded(style);
+                    }
+                });
+    }
+
+    private void customLocationComponentOptions(@NonNull Style style) {
+        if (locationComponent == null || style == null) return;
+        LocationComponentActivationOptions.Builder options =
+                LocationComponentActivationOptions
+                        .builder(context, style);
 //                      .locationComponentOptions(buildLocationComponentOptions(style));
-    if (this.isCustomizeLocationMarker) {
+        if (this.isCustomizeLocationMarker) {
 
-      Log.d(TAG, "enableLocationComponent: customizeLocationMarker");
-      final LocationComponentOptions.Builder optionsBuilder =
-              LocationComponentOptions.builder(context);
-      optionsBuilder.trackingGesturesManagement(true);
+            Log.d(TAG, "enableLocationComponent: customizeLocationMarker");
+            final LocationComponentOptions.Builder optionsBuilder =
+                    LocationComponentOptions.builder(context);
+            optionsBuilder.trackingGesturesManagement(true);
 
 //      final String lastLayerId = getLastLayerOnStyle(style);
 
@@ -331,103 +389,103 @@ final class VietmapGLController
 //        optionsBuilder.layerAbove(lastLayerId);
 //      }
 
-      optionsBuilder.backgroundDrawable(R.drawable.ic_action_name);
-      optionsBuilder.foregroundDrawable(R.drawable.ic_action_name);
-      optionsBuilder.bearingDrawable(R.drawable.ic_action_name);
-      optionsBuilder.gpsDrawable(R.drawable.ic_action_name);
-      optionsBuilder.backgroundDrawableStale(R.drawable.ic_action_name);
-      optionsBuilder.foregroundDrawableStale(R.drawable.ic_action_name);
-      optionsBuilder.pulseColor(Color.TRANSPARENT);
-      optionsBuilder.accuracyColor(Color.TRANSPARENT);
-      optionsBuilder.bearingTintColor(Color.TRANSPARENT);
-      optionsBuilder.backgroundStaleTintColor(Color.TRANSPARENT);
-      optionsBuilder.backgroundTintColor(Color.TRANSPARENT);
-      optionsBuilder.foregroundStaleTintColor(Color.TRANSPARENT);
-      optionsBuilder.foregroundTintColor(Color.TRANSPARENT);
+            optionsBuilder.backgroundDrawable(R.drawable.ic_action_name);
+            optionsBuilder.foregroundDrawable(R.drawable.ic_action_name);
+            optionsBuilder.bearingDrawable(R.drawable.ic_action_name);
+            optionsBuilder.gpsDrawable(R.drawable.ic_action_name);
+            optionsBuilder.backgroundDrawableStale(R.drawable.ic_action_name);
+            optionsBuilder.foregroundDrawableStale(R.drawable.ic_action_name);
+            optionsBuilder.pulseColor(Color.TRANSPARENT);
+            optionsBuilder.accuracyColor(Color.TRANSPARENT);
+            optionsBuilder.bearingTintColor(Color.TRANSPARENT);
+            optionsBuilder.backgroundStaleTintColor(Color.TRANSPARENT);
+            optionsBuilder.backgroundTintColor(Color.TRANSPARENT);
+            optionsBuilder.foregroundStaleTintColor(Color.TRANSPARENT);
+            optionsBuilder.foregroundTintColor(Color.TRANSPARENT);
 
-      optionsBuilder.elevation(0);
-      optionsBuilder.pulseAlpha(0);
-      optionsBuilder.accuracyAlpha(0);
-      options.locationComponentOptions(optionsBuilder.build());
+            optionsBuilder.elevation(0);
+            optionsBuilder.pulseAlpha(0);
+            optionsBuilder.accuracyAlpha(0);
+            options.locationComponentOptions(optionsBuilder.build());
+        }
+        locationComponent.activateLocationComponent(options.build());
     }
-    locationComponent.activateLocationComponent(options.build());
-  }
 
-  @SuppressWarnings({"MissingPermission"})
-  private void enableLocationComponent(@NonNull Style style) {
-    if (hasLocationPermission()) {
+    @SuppressWarnings({"MissingPermission"})
+    private void enableLocationComponent(@NonNull Style style) {
+        if (hasLocationPermission()) {
 
-      locationComponent = vietmapGL.getLocationComponent();
-      customLocationComponentOptions(style);
-      locationComponent.setLocationComponentEnabled(true);
-      locationComponent.setMaxAnimationFps(30);
-      updateMyLocationTrackingMode();
-      updateMyLocationRenderMode();
-      locationComponent.addOnCameraTrackingChangedListener(this);
-    } else {
-      Log.e(TAG, "missing location permissions");
+            locationComponent = vietmapGL.getLocationComponent();
+            customLocationComponentOptions(style);
+            locationComponent.setLocationComponentEnabled(true);
+            locationComponent.setMaxAnimationFps(30);
+            updateMyLocationTrackingMode();
+            updateMyLocationRenderMode();
+            locationComponent.addOnCameraTrackingChangedListener(this);
+        } else {
+            Log.e(TAG, "missing location permissions");
+        }
     }
-  }
 
-  private void updateLocationComponentLayer() {
-    if (locationComponent != null && locationComponentRequiresUpdate()) {
-      locationComponent.applyStyle(buildLocationComponentOptions(style));
+    private void updateLocationComponentLayer() {
+        if (locationComponent != null && locationComponentRequiresUpdate()) {
+            locationComponent.applyStyle(buildLocationComponentOptions(style));
+        }
     }
-  }
 
-  private void clearLocationComponentLayer() {
-    if (locationComponent != null) {
-      locationComponent.applyStyle(buildLocationComponentOptions(null));
+    private void clearLocationComponentLayer() {
+        if (locationComponent != null) {
+            locationComponent.applyStyle(buildLocationComponentOptions(null));
+        }
     }
-  }
 
-  String getLastLayerOnStyle(Style style) {
-    if (style != null) {
-      final List<Layer> layers = style.getLayers();
+    String getLastLayerOnStyle(Style style) {
+        if (style != null) {
+            final List<Layer> layers = style.getLayers();
 
-      if (layers.size() > 0) {
-        return layers.get(layers.size() - 1).getId();
-      }
+            if (layers.size() > 0) {
+                return layers.get(layers.size() - 1).getId();
+            }
+        }
+        return null;
     }
-    return null;
-  }
 
-  /// only update if the last layer is not the mapbox-location-bearing-layer
-  boolean locationComponentRequiresUpdate() {
-    final String lastLayerId = getLastLayerOnStyle(style);
-    return lastLayerId != null && !lastLayerId.equals("mapbox-location-bearing-layer");
-  }
-
-  private LocationComponentOptions buildLocationComponentOptions(Style style) {
-    final LocationComponentOptions.Builder optionsBuilder =
-        LocationComponentOptions.builder(context);
-    optionsBuilder.trackingGesturesManagement(true);
-
-    final String lastLayerId = getLastLayerOnStyle(style);
-    if (lastLayerId != null) {
-      optionsBuilder.layerAbove(lastLayerId);
+    /// only update if the last layer is not the mapbox-location-bearing-layer
+    boolean locationComponentRequiresUpdate() {
+        final String lastLayerId = getLastLayerOnStyle(style);
+        return lastLayerId != null && !lastLayerId.equals("mapbox-location-bearing-layer");
     }
-    if(isCustomizeLocationMarker) {
-      optionsBuilder.backgroundDrawable(R.drawable.ic_action_name);
-      optionsBuilder.foregroundDrawable(R.drawable.ic_action_name);
-      optionsBuilder.bearingDrawable(R.drawable.ic_action_name);
-      optionsBuilder.gpsDrawable(R.drawable.ic_action_name);
-      optionsBuilder.backgroundDrawableStale(R.drawable.ic_action_name);
-      optionsBuilder.foregroundDrawableStale(R.drawable.ic_action_name);
-      optionsBuilder.pulseColor(Color.TRANSPARENT);
-      optionsBuilder.accuracyColor(Color.TRANSPARENT);
-      optionsBuilder.bearingTintColor(Color.TRANSPARENT);
-      optionsBuilder.backgroundStaleTintColor(Color.TRANSPARENT);
-      optionsBuilder.backgroundTintColor(Color.TRANSPARENT);
-      optionsBuilder.foregroundStaleTintColor(Color.TRANSPARENT);
-      optionsBuilder.foregroundTintColor(Color.TRANSPARENT);
 
-      optionsBuilder.elevation(0);
-      optionsBuilder.pulseAlpha(0);
-      optionsBuilder.accuracyAlpha(0);
+    private LocationComponentOptions buildLocationComponentOptions(Style style) {
+        final LocationComponentOptions.Builder optionsBuilder =
+                LocationComponentOptions.builder(context);
+        optionsBuilder.trackingGesturesManagement(true);
+
+        final String lastLayerId = getLastLayerOnStyle(style);
+        if (lastLayerId != null) {
+            optionsBuilder.layerAbove(lastLayerId);
+        }
+        if (isCustomizeLocationMarker) {
+            optionsBuilder.backgroundDrawable(R.drawable.ic_action_name);
+            optionsBuilder.foregroundDrawable(R.drawable.ic_action_name);
+            optionsBuilder.bearingDrawable(R.drawable.ic_action_name);
+            optionsBuilder.gpsDrawable(R.drawable.ic_action_name);
+            optionsBuilder.backgroundDrawableStale(R.drawable.ic_action_name);
+            optionsBuilder.foregroundDrawableStale(R.drawable.ic_action_name);
+            optionsBuilder.pulseColor(Color.TRANSPARENT);
+            optionsBuilder.accuracyColor(Color.TRANSPARENT);
+            optionsBuilder.bearingTintColor(Color.TRANSPARENT);
+            optionsBuilder.backgroundStaleTintColor(Color.TRANSPARENT);
+            optionsBuilder.backgroundTintColor(Color.TRANSPARENT);
+            optionsBuilder.foregroundStaleTintColor(Color.TRANSPARENT);
+            optionsBuilder.foregroundTintColor(Color.TRANSPARENT);
+
+            optionsBuilder.elevation(0);
+            optionsBuilder.pulseAlpha(0);
+            optionsBuilder.accuracyAlpha(0);
+        }
+        return optionsBuilder.build();
     }
-    return optionsBuilder.build();
-  }
 
 //  private LocationComponentOptions buildLocationComponentOptions(Style style) {
 //    final LocationComponentOptions.Builder optionsBuilder =
@@ -441,1554 +499,1677 @@ final class VietmapGLController
 //    return optionsBuilder.build();
 //  }
 
-  private void onUserLocationUpdate(Location location) {
-    if (location == null) {
-      return;
-    }
-
-    final Map<String, Object> userLocation = new HashMap<>(6);
-    userLocation.put("position", new double[] {location.getLatitude(), location.getLongitude()});
-    userLocation.put("speed", location.getSpeed());
-    userLocation.put("altitude", location.getAltitude());
-    userLocation.put("bearing", location.getBearing());
-    userLocation.put("speed", location.getSpeed());
-    userLocation.put("horizontalAccuracy", location.getAccuracy());
-    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-      userLocation.put(
-          "verticalAccuracy",
-          (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
-              ? location.getVerticalAccuracyMeters()
-              : null);
-    }
-    userLocation.put("timestamp", location.getTime());
-
-    final Map<String, Object> arguments = new HashMap<>(1);
-    arguments.put("userLocation", userLocation);
-    methodChannel.invokeMethod("map#onUserLocationUpdated", arguments);
-  }
-
-  private void addGeoJsonSource(String sourceName, String source) {
-    FeatureCollection featureCollection = FeatureCollection.fromJson(source);
-    GeoJsonSource geoJsonSource = new GeoJsonSource(sourceName, featureCollection);
-    addedFeaturesByLayer.put(sourceName, featureCollection);
-
-    style.addSource(geoJsonSource);
-  }
-
-  private void setGeoJsonSource(String sourceName, String geojson) {
-    FeatureCollection featureCollection = FeatureCollection.fromJson(geojson);
-    GeoJsonSource geoJsonSource = style.getSourceAs(sourceName);
-    addedFeaturesByLayer.put(sourceName, featureCollection);
-
-    geoJsonSource.setGeoJson(featureCollection);
-  }
-
-  private void setGeoJsonFeature(String sourceName, String geojsonFeature) {
-    Feature feature = Feature.fromJson(geojsonFeature);
-    FeatureCollection featureCollection = addedFeaturesByLayer.get(sourceName);
-    GeoJsonSource geoJsonSource = style.getSourceAs(sourceName);
-    if (featureCollection != null && geoJsonSource != null) {
-      final List<Feature> features = featureCollection.features();
-      for (int i = 0; i < features.size(); i++) {
-        final String id = features.get(i).id();
-        if (id.equals(feature.id())) {
-          features.set(i, feature);
-          break;
+    private void onUserLocationUpdate(Location location) {
+        if (location == null) {
+            return;
         }
-      }
 
-      geoJsonSource.setGeoJson(featureCollection);
-    }
-  }
-
-  private void addSymbolLayer(
-      String layerName,
-      String sourceName,
-      String belowLayerId,
-      String sourceLayer,
-      Float minZoom,
-      Float maxZoom,
-      PropertyValue[] properties,
-      boolean enableInteraction,
-      Expression filter) {
-    SymbolLayer symbolLayer = new SymbolLayer(layerName, sourceName);
-    symbolLayer.setProperties(properties);
-    if (sourceLayer != null) {
-      symbolLayer.setSourceLayer(sourceLayer);
-    }
-    if (minZoom != null) {
-      symbolLayer.setMinZoom(minZoom);
-    }
-    if (maxZoom != null) {
-      symbolLayer.setMaxZoom(maxZoom);
-    }
-    if (filter != null) {
-      symbolLayer.setFilter(filter);
-    }
-    if (belowLayerId != null) {
-      style.addLayerBelow(symbolLayer, belowLayerId);
-    } else {
-      style.addLayer(symbolLayer);
-    }
-    if (enableInteraction) {
-      interactiveFeatureLayerIds.add(layerName);
-    }
-  }
-
-  private void addLineLayer(
-      String layerName,
-      String sourceName,
-      String belowLayerId,
-      String sourceLayer,
-      Float minZoom,
-      Float maxZoom,
-      PropertyValue[] properties,
-      boolean enableInteraction,
-      Expression filter) {
-    LineLayer lineLayer = new LineLayer(layerName, sourceName);
-    lineLayer.setProperties(properties);
-    if (sourceLayer != null) {
-      lineLayer.setSourceLayer(sourceLayer);
-    }
-    if (minZoom != null) {
-      lineLayer.setMinZoom(minZoom);
-    }
-    if (maxZoom != null) {
-      lineLayer.setMaxZoom(maxZoom);
-    }
-    if (filter != null) {
-      lineLayer.setFilter(filter);
-    }
-    if (belowLayerId != null) {
-      style.addLayerBelow(lineLayer, belowLayerId);
-    } else {
-      style.addLayer(lineLayer);
-    }
-    if (enableInteraction) {
-      interactiveFeatureLayerIds.add(layerName);
-    }
-  }
-
-  private void addFillLayer(
-      String layerName,
-      String sourceName,
-      String belowLayerId,
-      String sourceLayer,
-      Float minZoom,
-      Float maxZoom,
-      PropertyValue[] properties,
-      boolean enableInteraction,
-      Expression filter) {
-    FillLayer fillLayer = new FillLayer(layerName, sourceName);
-    fillLayer.setProperties(properties);
-    if (sourceLayer != null) {
-      fillLayer.setSourceLayer(sourceLayer);
-    }
-    if (minZoom != null) {
-      fillLayer.setMinZoom(minZoom);
-    }
-    if (maxZoom != null) {
-      fillLayer.setMaxZoom(maxZoom);
-    }
-    if (filter != null) {
-      fillLayer.setFilter(filter);
-    }
-    if (belowLayerId != null) {
-      style.addLayerBelow(fillLayer, belowLayerId);
-    } else {
-      style.addLayer(fillLayer);
-    }
-    if (enableInteraction) {
-      interactiveFeatureLayerIds.add(layerName);
-    }
-  }
-
-  private void addFillExtrusionLayer(
-          String layerName,
-          String sourceName,
-          String belowLayerId,
-          String sourceLayer,
-          Float minZoom,
-          Float maxZoom,
-          PropertyValue[] properties,
-          boolean enableInteraction,
-          Expression filter) {
-    FillExtrusionLayer fillLayer = new FillExtrusionLayer(layerName, sourceName);
-    fillLayer.setProperties(properties);
-    if (sourceLayer != null) {
-      fillLayer.setSourceLayer(sourceLayer);
-    }
-    if (minZoom != null) {
-      fillLayer.setMinZoom(minZoom);
-    }
-    if (maxZoom != null) {
-      fillLayer.setMaxZoom(maxZoom);
-    }
-    if (filter != null) {
-      fillLayer.setFilter(filter);
-    }
-    if (belowLayerId != null) {
-      style.addLayerBelow(fillLayer, belowLayerId);
-    } else {
-      style.addLayer(fillLayer);
-    }
-    if (enableInteraction) {
-      interactiveFeatureLayerIds.add(layerName);
-    }
-  }
-
-  private void addCircleLayer(
-      String layerName,
-      String sourceName,
-      String belowLayerId,
-      String sourceLayer,
-      Float minZoom,
-      Float maxZoom,
-      PropertyValue[] properties,
-      boolean enableInteraction,
-      Expression filter) {
-    CircleLayer circleLayer = new CircleLayer(layerName, sourceName);
-    circleLayer.setProperties(properties);
-    if (sourceLayer != null) {
-      circleLayer.setSourceLayer(sourceLayer);
-    }
-    if (minZoom != null) {
-      circleLayer.setMinZoom(minZoom);
-    }
-    if (maxZoom != null) {
-      circleLayer.setMaxZoom(maxZoom);
-    }
-    if (filter != null) {
-      circleLayer.setFilter(filter);
-    }
-    if (belowLayerId != null) {
-      style.addLayerBelow(circleLayer, belowLayerId);
-    } else {
-      style.addLayer(circleLayer);
-    }
-    if (enableInteraction) {
-      interactiveFeatureLayerIds.add(layerName);
-    }
-  }
-
-  private Expression parseFilter(String filter) {
-    JsonParser parser = new JsonParser();
-    JsonElement filterJsonElement = parser.parse(filter);
-    return filterJsonElement.isJsonNull() ? null : Expression.Converter.convert(filterJsonElement);
-  }
-
-  private void addRasterLayer(
-      String layerName,
-      String sourceName,
-      Float minZoom,
-      Float maxZoom,
-      String belowLayerId,
-      PropertyValue[] properties,
-      Expression filter) {
-    RasterLayer layer = new RasterLayer(layerName, sourceName);
-    layer.setProperties(properties);
-    if (minZoom != null) {
-      layer.setMinZoom(minZoom);
-    }
-    if (maxZoom != null) {
-      layer.setMaxZoom(maxZoom);
-    }
-    if (belowLayerId != null) {
-      style.addLayerBelow(layer, belowLayerId);
-    } else {
-      style.addLayer(layer);
-    }
-  }
-
-  private void addHillshadeLayer(
-      String layerName,
-      String sourceName,
-      Float minZoom,
-      Float maxZoom,
-      String belowLayerId,
-      PropertyValue[] properties,
-      Expression filter) {
-    HillshadeLayer layer = new HillshadeLayer(layerName, sourceName);
-    layer.setProperties(properties);
-    if (minZoom != null) {
-      layer.setMinZoom(minZoom);
-    }
-    if (maxZoom != null) {
-      layer.setMaxZoom(maxZoom);
-    }
-    if (belowLayerId != null) {
-      style.addLayerBelow(layer, belowLayerId);
-    } else {
-      style.addLayer(layer);
-    }
-  }
-
-  private void addHeatmapLayer(
-      String layerName,
-      String sourceName,
-      Float minZoom,
-      Float maxZoom,
-      String belowLayerId,
-      PropertyValue[] properties,
-      Expression filter) {
-    HeatmapLayer layer = new HeatmapLayer(layerName, sourceName);
-    layer.setProperties(properties);
-    if (minZoom != null) {
-      layer.setMinZoom(minZoom);
-    }
-    if (maxZoom != null) {
-      layer.setMaxZoom(maxZoom);
-    }
-    if (belowLayerId != null) {
-      style.addLayerBelow(layer, belowLayerId);
-    } else {
-      style.addLayer(layer);
-    }
-  }
-
-  private Pair<Feature, String> firstFeatureOnLayers(RectF in) {
-    if (style != null) {
-      final List<Layer> layers = style.getLayers();
-      final List<String> layersInOrder = new ArrayList<String>();
-      for (Layer layer : layers) {
-        String id = layer.getId();
-        if (interactiveFeatureLayerIds.contains(id)) layersInOrder.add(id);
-      }
-      Collections.reverse(layersInOrder);
-
-      for (String id : layersInOrder) {
-        List<Feature> features = vietmapGL.queryRenderedFeatures(in, id);
-        if (!features.isEmpty()) {
-          return new Pair<Feature, String>(features.get(0), id);
+        final Map<String, Object> userLocation = new HashMap<>(6);
+        userLocation.put("position", new double[]{location.getLatitude(), location.getLongitude()});
+        userLocation.put("speed", location.getSpeed());
+        userLocation.put("altitude", location.getAltitude());
+        userLocation.put("bearing", location.getBearing());
+        userLocation.put("speed", location.getSpeed());
+        userLocation.put("horizontalAccuracy", location.getAccuracy());
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            userLocation.put(
+                    "verticalAccuracy",
+                    (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O)
+                            ? location.getVerticalAccuracyMeters()
+                            : null);
         }
-      }
+        userLocation.put("timestamp", location.getTime());
+
+        final Map<String, Object> arguments = new HashMap<>(1);
+        arguments.put("userLocation", userLocation);
+        methodChannel.invokeMethod("map#onUserLocationUpdated", arguments);
     }
-    return null;
-  }
 
-  @Override
-  public void onMethodCall(MethodCall call, MethodChannel.Result result) {
+    private void addGeoJsonSource(String sourceName, String source) {
+        FeatureCollection featureCollection = FeatureCollection.fromJson(source);
+        GeoJsonSource geoJsonSource = new GeoJsonSource(sourceName, featureCollection);
+        addedFeaturesByLayer.put(sourceName, featureCollection);
 
-    switch (call.method) {
-      case "map#waitForMap":
-        if (vietmapGL != null) {
-          result.success(null);
-          return;
-        }
-        mapReadyResult = result;
-        break;
-      case "map#update":
-        {
-          Convert.interpretVietMapGLOptions(call.argument("options"), this, context);
-          result.success(Convert.toJson(getCameraPosition()));
-          break;
-        }
-      case "map#updateMyLocationTrackingMode":
-        {
-          int myLocationTrackingMode = call.argument("mode");
-          setMyLocationTrackingMode(myLocationTrackingMode);
-          result.success(null);
-          break;
-        }
-      case "map#matchMapLanguageWithDeviceDefault":
-        {
-          try {
-            final Locale deviceLocale = Locale.getDefault();
-            MapLibreMapUtils.setMapLanguage(vietmapGL, deviceLocale.getLanguage());
+        style.addSource(geoJsonSource);
+    }
 
-            result.success(null);
-          } catch (RuntimeException exception) {
-            Log.d(TAG, exception.toString());
-            result.error("MAPBOX LOCALIZATION PLUGIN ERROR", exception.toString(), null);
-          }
-          break;
-        }
-      case "map#recenter": {
-            LocationComponent component = vietmapGL.getLocationComponent();
-            component.forceLocationUpdate(component.getLastKnownLocation());
-            double zoom = vietmapGL.getCameraPosition().zoom;
-            vietmapGL.animateCamera(CameraUpdateFactory.newLatLngZoom(new LatLng(component.getLastKnownLocation()), zoom));
-            break;
-        }
-      case "map#updateContentInsets":
-        {
-          HashMap<String, Object> insets = call.argument("bounds");
-          final CameraUpdate cameraUpdate =
-              CameraUpdateFactory.paddingTo(
-                  Convert.toPixels(insets.get("left"), density),
-                  Convert.toPixels(insets.get("top"), density),
-                  Convert.toPixels(insets.get("right"), density),
-                  Convert.toPixels(insets.get("bottom"), density));
+    private void setGeoJsonSource(String sourceName, String geojson) {
+        FeatureCollection featureCollection = FeatureCollection.fromJson(geojson);
+        GeoJsonSource geoJsonSource = style.getSourceAs(sourceName);
+        addedFeaturesByLayer.put(sourceName, featureCollection);
 
-          if (call.argument("animated")) {
-            animateCamera(cameraUpdate, null, result);
-          } else {
-            moveCamera(cameraUpdate, result);
-          }
-          break;
+        // The source is gone whenever the style was swapped between the Dart call
+        // being queued and it being handled. Nothing to update in that case.
+        if (geoJsonSource == null) {
+            Log.w(TAG, "setGeoJsonSource: source '" + sourceName + "' not found in the current style");
+            return;
         }
-      case "map#setMapLanguage":
-        {
-          final String language = call.argument("language");
-          try {
-            MapLibreMapUtils.setMapLanguage(vietmapGL, language);
+        geoJsonSource.setGeoJson(featureCollection);
+    }
 
-            result.success(null);
-          } catch (RuntimeException exception) {
-            Log.d(TAG, exception.toString());
-            result.error("VIETMAP LOCALIZATION PLUGIN ERROR", exception.toString(), null);
-          }
-          break;
-        }
-      case "map#getVisibleRegion":
-        {
-          Map<String, Object> reply = new HashMap<>();
-          VisibleRegion visibleRegion = vietmapGL.getProjection().getVisibleRegion();
-          reply.put(
-              "sw",
-              Arrays.asList(
-                  visibleRegion.latLngBounds.getLatSouth(), visibleRegion.latLngBounds.getLonWest()));
-          reply.put(
-              "ne",
-              Arrays.asList(
-                    visibleRegion.latLngBounds.getLatNorth(), visibleRegion.latLngBounds.getLonEast()));
+    private void setGeoJsonFeature(String sourceName, String geojsonFeature) {
+        Feature feature = Feature.fromJson(geojsonFeature);
+        FeatureCollection featureCollection = addedFeaturesByLayer.get(sourceName);
+        GeoJsonSource geoJsonSource = style.getSourceAs(sourceName);
+        if (featureCollection != null && geoJsonSource != null) {
+            final List<Feature> features = featureCollection.features();
+            for (int i = 0; i < features.size(); i++) {
+                final String id = features.get(i).id();
+                if (id.equals(feature.id())) {
+                    features.set(i, feature);
+                    break;
+                }
+            }
 
-          result.success(reply);
-          break;
+            geoJsonSource.setGeoJson(featureCollection);
         }
-      case "map#toScreenLocation":
-        {
-          Map<String, Object> reply = new HashMap<>();
-          PointF pointf =
-              vietmapGL
-                  .getProjection()
-                  .toScreenLocation(
-                      new LatLng(call.argument("latitude"), call.argument("longitude")));
-          reply.put("x", pointf.x);
-          reply.put("y", pointf.y);
-          result.success(reply);
-          break;
-        }
-      case "map#toScreenLocationBatch":
-        {
-          double[] param = (double[]) call.argument("coordinates");
-          double[] reply = new double[param.length];
+    }
 
-          for (int i = 0; i < param.length; i += 2) {
-            PointF pointf =
-                vietmapGL.getProjection().toScreenLocation(new LatLng(param[i], param[i + 1]));
-            reply[i] = pointf.x;
-            reply[i + 1] = pointf.y;
-          }
+    private void addSymbolLayer(
+            String layerName,
+            String sourceName,
+            String belowLayerId,
+            String sourceLayer,
+            Float minZoom,
+            Float maxZoom,
+            PropertyValue[] properties,
+            boolean enableInteraction,
+            Expression filter) {
+        SymbolLayer symbolLayer = new SymbolLayer(layerName, sourceName);
+        symbolLayer.setProperties(properties);
+        if (sourceLayer != null) {
+            symbolLayer.setSourceLayer(sourceLayer);
+        }
+        if (minZoom != null) {
+            symbolLayer.setMinZoom(minZoom);
+        }
+        if (maxZoom != null) {
+            symbolLayer.setMaxZoom(maxZoom);
+        }
+        if (filter != null) {
+            symbolLayer.setFilter(filter);
+        }
+        if (belowLayerId != null) {
+            style.addLayerBelow(symbolLayer, belowLayerId);
+        } else {
+            style.addLayer(symbolLayer);
+        }
+        if (enableInteraction) {
+            interactiveFeatureLayerIds.add(layerName);
+        }
+    }
 
-          result.success(reply);
-          break;
+    private void addLineLayer(
+            String layerName,
+            String sourceName,
+            String belowLayerId,
+            String sourceLayer,
+            Float minZoom,
+            Float maxZoom,
+            PropertyValue[] properties,
+            boolean enableInteraction,
+            Expression filter) {
+        LineLayer lineLayer = new LineLayer(layerName, sourceName);
+        lineLayer.setProperties(properties);
+        if (sourceLayer != null) {
+            lineLayer.setSourceLayer(sourceLayer);
         }
-      case "map#toLatLng":
-        {
-          Map<String, Object> reply = new HashMap<>();
-          LatLng latlng =
-              vietmapGL
-                  .getProjection()
-                  .fromScreenLocation(
-                      new PointF(
-                          ((Double) call.argument("x")).floatValue(),
-                          ((Double) call.argument("y")).floatValue()));
-          reply.put("latitude", latlng.getLatitude());
-          reply.put("longitude", latlng.getLongitude());
-          result.success(reply);
-          break;
+        if (minZoom != null) {
+            lineLayer.setMinZoom(minZoom);
         }
-      case "map#getMetersPerPixelAtLatitude":
-        {
-          Map<String, Object> reply = new HashMap<>();
-          Double retVal =
-              vietmapGL
-                  .getProjection()
-                  .getMetersPerPixelAtLatitude((Double) call.argument("latitude"));
-          reply.put("metersperpixel", retVal);
-          result.success(reply);
-          break;
+        if (maxZoom != null) {
+            lineLayer.setMaxZoom(maxZoom);
         }
-      case "camera#move":
-        {
-          final CameraUpdate cameraUpdate =
-              Convert.toCameraUpdate(call.argument("cameraUpdate"), vietmapGL, density);
-          if (cameraUpdate != null) {
+        if (filter != null) {
+            lineLayer.setFilter(filter);
+        }
+        if (belowLayerId != null) {
+            style.addLayerBelow(lineLayer, belowLayerId);
+        } else {
+            style.addLayer(lineLayer);
+        }
+        if (enableInteraction) {
+            interactiveFeatureLayerIds.add(layerName);
+        }
+    }
+
+    private void addFillLayer(
+            String layerName,
+            String sourceName,
+            String belowLayerId,
+            String sourceLayer,
+            Float minZoom,
+            Float maxZoom,
+            PropertyValue[] properties,
+            boolean enableInteraction,
+            Expression filter) {
+        FillLayer fillLayer = new FillLayer(layerName, sourceName);
+        fillLayer.setProperties(properties);
+        if (sourceLayer != null) {
+            fillLayer.setSourceLayer(sourceLayer);
+        }
+        if (minZoom != null) {
+            fillLayer.setMinZoom(minZoom);
+        }
+        if (maxZoom != null) {
+            fillLayer.setMaxZoom(maxZoom);
+        }
+        if (filter != null) {
+            fillLayer.setFilter(filter);
+        }
+        if (belowLayerId != null) {
+            style.addLayerBelow(fillLayer, belowLayerId);
+        } else {
+            style.addLayer(fillLayer);
+        }
+        if (enableInteraction) {
+            interactiveFeatureLayerIds.add(layerName);
+        }
+    }
+
+    private void addFillExtrusionLayer(
+            String layerName,
+            String sourceName,
+            String belowLayerId,
+            String sourceLayer,
+            Float minZoom,
+            Float maxZoom,
+            PropertyValue[] properties,
+            boolean enableInteraction,
+            Expression filter) {
+        FillExtrusionLayer fillLayer = new FillExtrusionLayer(layerName, sourceName);
+        fillLayer.setProperties(properties);
+        if (sourceLayer != null) {
+            fillLayer.setSourceLayer(sourceLayer);
+        }
+        if (minZoom != null) {
+            fillLayer.setMinZoom(minZoom);
+        }
+        if (maxZoom != null) {
+            fillLayer.setMaxZoom(maxZoom);
+        }
+        if (filter != null) {
+            fillLayer.setFilter(filter);
+        }
+        if (belowLayerId != null) {
+            style.addLayerBelow(fillLayer, belowLayerId);
+        } else {
+            style.addLayer(fillLayer);
+        }
+        if (enableInteraction) {
+            interactiveFeatureLayerIds.add(layerName);
+        }
+    }
+
+    private void addCircleLayer(
+            String layerName,
+            String sourceName,
+            String belowLayerId,
+            String sourceLayer,
+            Float minZoom,
+            Float maxZoom,
+            PropertyValue[] properties,
+            boolean enableInteraction,
+            Expression filter) {
+        CircleLayer circleLayer = new CircleLayer(layerName, sourceName);
+        circleLayer.setProperties(properties);
+        if (sourceLayer != null) {
+            circleLayer.setSourceLayer(sourceLayer);
+        }
+        if (minZoom != null) {
+            circleLayer.setMinZoom(minZoom);
+        }
+        if (maxZoom != null) {
+            circleLayer.setMaxZoom(maxZoom);
+        }
+        if (filter != null) {
+            circleLayer.setFilter(filter);
+        }
+        if (belowLayerId != null) {
+            style.addLayerBelow(circleLayer, belowLayerId);
+        } else {
+            style.addLayer(circleLayer);
+        }
+        if (enableInteraction) {
+            interactiveFeatureLayerIds.add(layerName);
+        }
+    }
+
+    private Expression parseFilter(String filter) {
+        JsonParser parser = new JsonParser();
+        JsonElement filterJsonElement = parser.parse(filter);
+        return filterJsonElement.isJsonNull() ? null : Expression.Converter.convert(filterJsonElement);
+    }
+
+    private void addRasterLayer(
+            String layerName,
+            String sourceName,
+            Float minZoom,
+            Float maxZoom,
+            String belowLayerId,
+            PropertyValue[] properties,
+            Expression filter) {
+        RasterLayer layer = new RasterLayer(layerName, sourceName);
+        layer.setProperties(properties);
+        if (minZoom != null) {
+            layer.setMinZoom(minZoom);
+        }
+        if (maxZoom != null) {
+            layer.setMaxZoom(maxZoom);
+        }
+        if (belowLayerId != null) {
+            style.addLayerBelow(layer, belowLayerId);
+        } else {
+            style.addLayer(layer);
+        }
+    }
+
+    private void addHillshadeLayer(
+            String layerName,
+            String sourceName,
+            Float minZoom,
+            Float maxZoom,
+            String belowLayerId,
+            PropertyValue[] properties,
+            Expression filter) {
+        HillshadeLayer layer = new HillshadeLayer(layerName, sourceName);
+        layer.setProperties(properties);
+        if (minZoom != null) {
+            layer.setMinZoom(minZoom);
+        }
+        if (maxZoom != null) {
+            layer.setMaxZoom(maxZoom);
+        }
+        if (belowLayerId != null) {
+            style.addLayerBelow(layer, belowLayerId);
+        } else {
+            style.addLayer(layer);
+        }
+    }
+
+    private void addHeatmapLayer(
+            String layerName,
+            String sourceName,
+            Float minZoom,
+            Float maxZoom,
+            String belowLayerId,
+            PropertyValue[] properties,
+            Expression filter) {
+        HeatmapLayer layer = new HeatmapLayer(layerName, sourceName);
+        layer.setProperties(properties);
+        if (minZoom != null) {
+            layer.setMinZoom(minZoom);
+        }
+        if (maxZoom != null) {
+            layer.setMaxZoom(maxZoom);
+        }
+        if (belowLayerId != null) {
+            style.addLayerBelow(layer, belowLayerId);
+        } else {
+            style.addLayer(layer);
+        }
+    }
+
+    private Pair<Feature, String> firstFeatureOnLayers(RectF in) {
+        if (style != null) {
+            final List<Layer> layers = style.getLayers();
+            final List<String> layersInOrder = new ArrayList<String>();
+            for (Layer layer : layers) {
+                String id = layer.getId();
+                if (interactiveFeatureLayerIds.contains(id)) layersInOrder.add(id);
+            }
+            Collections.reverse(layersInOrder);
+
+            for (String id : layersInOrder) {
+                List<Feature> features = vietmapGL.queryRenderedFeatures(in, id);
+                if (!features.isEmpty()) {
+                    return new Pair<Feature, String>(features.get(0), id);
+                }
+            }
+        }
+        return null;
+    }
+
+    @Override
+    public void onMethodCall(MethodCall call, MethodChannel.Result result) {
+
+        switch (call.method) {
+            case "map#waitForMap":
+                if (vietmapGL != null) {
+                    result.success(null);
+                    return;
+                }
+                mapReadyResult = result;
+                break;
+            case "map#update": {
+                Convert.interpretVietMapGLOptions(call.argument("options"), this, context);
+                result.success(Convert.toJson(getCameraPosition()));
+                break;
+            }
+            case "map#updateMyLocationTrackingMode": {
+                int myLocationTrackingMode = call.argument("mode");
+                setMyLocationTrackingMode(myLocationTrackingMode);
+                result.success(null);
+                break;
+            }
+            case "map#matchMapLanguageWithDeviceDefault": {
+                try {
+                    final Locale deviceLocale = Locale.getDefault();
+                    MapLibreMapUtils.setMapLanguage(vietmapGL, deviceLocale.getLanguage());
+
+                    result.success(null);
+                } catch (RuntimeException exception) {
+                    Log.d(TAG, exception.toString());
+                    result.error("MAPBOX LOCALIZATION PLUGIN ERROR", exception.toString(), null);
+                }
+                break;
+            }
+            case "map#recenter": {
+                LocationComponent component = vietmapGL.getLocationComponent();
+                component.forceLocationUpdate(component.getLastKnownLocation());
+                double zoom = vietmapGL.getCameraPosition().zoom;
+                vietmapGL.animateCamera(CameraUpdateFactory.newLatLngZoom(new LatLng(component.getLastKnownLocation()), zoom));
+                break;
+            }
+            case "map#updateContentInsets": {
+                HashMap<String, Object> insets = call.argument("bounds");
+                final CameraUpdate cameraUpdate =
+                        CameraUpdateFactory.paddingTo(
+                                Convert.toPixels(insets.get("left"), density),
+                                Convert.toPixels(insets.get("top"), density),
+                                Convert.toPixels(insets.get("right"), density),
+                                Convert.toPixels(insets.get("bottom"), density));
+
+                if (call.argument("animated")) {
+                    animateCamera(cameraUpdate, null, result);
+                } else {
+                    moveCamera(cameraUpdate, result);
+                }
+                break;
+            }
+            case "map#setMapLanguage": {
+                final String language = call.argument("language");
+                try {
+                    MapLibreMapUtils.setMapLanguage(vietmapGL, language);
+
+                    result.success(null);
+                } catch (RuntimeException exception) {
+                    Log.d(TAG, exception.toString());
+                    result.error("VIETMAP LOCALIZATION PLUGIN ERROR", exception.toString(), null);
+                }
+                break;
+            }
+            case "map#getVisibleRegion": {
+                Map<String, Object> reply = new HashMap<>();
+                VisibleRegion visibleRegion = vietmapGL.getProjection().getVisibleRegion();
+                reply.put(
+                        "sw",
+                        Arrays.asList(
+                                visibleRegion.latLngBounds.getLatSouth(), visibleRegion.latLngBounds.getLonWest()));
+                reply.put(
+                        "ne",
+                        Arrays.asList(
+                                visibleRegion.latLngBounds.getLatNorth(), visibleRegion.latLngBounds.getLonEast()));
+
+                result.success(reply);
+                break;
+            }
+            case "map#toScreenLocation": {
+                Map<String, Object> reply = new HashMap<>();
+                PointF pointf =
+                        vietmapGL
+                                .getProjection()
+                                .toScreenLocation(
+                                        new LatLng(call.argument("latitude"), call.argument("longitude")));
+                reply.put("x", pointf.x);
+                reply.put("y", pointf.y);
+                result.success(reply);
+                break;
+            }
+            case "map#toScreenLocationBatch": {
+                double[] param = (double[]) call.argument("coordinates");
+                double[] reply = new double[param.length];
+
+                for (int i = 0; i < param.length; i += 2) {
+                    PointF pointf =
+                            vietmapGL.getProjection().toScreenLocation(new LatLng(param[i], param[i + 1]));
+                    reply[i] = pointf.x;
+                    reply[i + 1] = pointf.y;
+                }
+
+                result.success(reply);
+                break;
+            }
+            case "map#toLatLng": {
+                Map<String, Object> reply = new HashMap<>();
+                LatLng latlng =
+                        vietmapGL
+                                .getProjection()
+                                .fromScreenLocation(
+                                        new PointF(
+                                                ((Double) call.argument("x")).floatValue(),
+                                                ((Double) call.argument("y")).floatValue()));
+                reply.put("latitude", latlng.getLatitude());
+                reply.put("longitude", latlng.getLongitude());
+                result.success(reply);
+                break;
+            }
+            case "map#getMetersPerPixelAtLatitude": {
+                Map<String, Object> reply = new HashMap<>();
+                Double retVal =
+                        vietmapGL
+                                .getProjection()
+                                .getMetersPerPixelAtLatitude((Double) call.argument("latitude"));
+                reply.put("metersperpixel", retVal);
+                result.success(reply);
+                break;
+            }
+            case "camera#move": {
+                final CameraUpdate cameraUpdate =
+                        Convert.toCameraUpdate(call.argument("cameraUpdate"), vietmapGL, density);
+                if (cameraUpdate != null) {
+                    // camera transformation not handled yet
+                    vietmapGL.moveCamera(
+                            cameraUpdate,
+                            new OnCameraMoveFinishedListener() {
+                                @Override
+                                public void onFinish() {
+                                    super.onFinish();
+                                    result.success(true);
+                                }
+
+                                @Override
+                                public void onCancel() {
+                                    super.onCancel();
+                                    result.success(false);
+                                }
+                            });
+
+                    // moveCamera(cameraUpdate);
+                } else {
+                    result.success(false);
+                }
+                break;
+            }
+            case "camera#animate": {
+                final CameraUpdate cameraUpdate =
+                        Convert.toCameraUpdate(call.argument("cameraUpdate"), vietmapGL, density);
+                final Integer duration = call.argument("duration");
+
+                final OnCameraMoveFinishedListener onCameraMoveFinishedListener =
+                        new OnCameraMoveFinishedListener() {
+                            @Override
+                            public void onFinish() {
+                                super.onFinish();
+                                result.success(true);
+                            }
+
+                            @Override
+                            public void onCancel() {
+                                super.onCancel();
+                                result.success(false);
+                            }
+                        };
+                if (cameraUpdate != null && duration != null) {
+                    // camera transformation not handled yet
+                    vietmapGL.animateCamera(cameraUpdate, duration, onCameraMoveFinishedListener);
+                } else if (cameraUpdate != null) {
+                    // camera transformation not handled yet
+                    vietmapGL.animateCamera(cameraUpdate, onCameraMoveFinishedListener);
+                } else {
+                    result.success(false);
+                }
+                break;
+            }
+            case "camera#ease": {
+                final CameraUpdate cameraUpdate =
+                        Convert.toCameraUpdate(call.argument("cameraUpdate"), vietmapGL, density);
+                final Integer duration = call.argument("duration");
+                final String interpolation = call.argument("interpolation");
+
+                // The native SDK's easeCamera only exposes a boolean:
+                //   false = linear (constant velocity)
+                //   true  = default ease-in/ease-out
+                // Custom timing curves (easeOut, fastOutLinearIn) have no native
+                // equivalent, so anything other than "linear" falls back to eased.
+                // This caveat is documented on CameraAnimationInterpolation.
+                final boolean easingInterpolator = !"linear".equals(interpolation);
+
+                final OnCameraMoveFinishedListener onEaseFinishedListener =
+                        new OnCameraMoveFinishedListener() {
+                            @Override
+                            public void onFinish() {
+                                super.onFinish();
+                                result.success(true);
+                            }
+
+                            @Override
+                            public void onCancel() {
+                                super.onCancel();
+                                result.success(false);
+                            }
+                        };
+
+                if (cameraUpdate != null && duration != null && duration > 0) {
+                    vietmapGL.easeCamera(
+                            cameraUpdate, duration, easingInterpolator, onEaseFinishedListener);
+                } else if (cameraUpdate != null) {
+                    vietmapGL.easeCamera(cameraUpdate, onEaseFinishedListener);
+                } else {
+                    result.success(false);
+                }
+                break;
+            }
+            case "map#updateUserLocationLayerIcon": {
+                isCustomizeLocationMarker = call.argument("isEnable");
+                if (vietmapGL != null) {
+                    updateMyLocationEnabled();
+                }
+                result.success(null);
+                break;
+            }
+            case "map#updateLogoEnabled": {
+                logoEnabled = call.argument("isEnable");
+                updateLogoEnabled();
+                result.success(null);
+                break;
+            }
+            case "map#queryRenderedFeatures": {
+                Map<String, Object> reply = new HashMap<>();
+                List<com.mapbox.geojson.Feature> features;
+                if (!call.hasArgument("layerIds")) return;
+
+                String[] layerIds = ((List<String>) call.argument("layerIds")).toArray(new String[0]);
+
+                List<Object> filter = call.argument("filter");
+                JsonElement jsonElement = filter == null ? null : new Gson().toJsonTree(filter);
+                JsonArray jsonArray = null;
+                if (jsonElement != null && jsonElement.isJsonArray()) {
+                    jsonArray = jsonElement.getAsJsonArray();
+                }
+                Expression filterExpression =
+                        jsonArray == null ? null : Expression.Converter.convert(jsonArray);
+                if (call.hasArgument("x")) {
+                    Double x = call.argument("x");
+                    Double y = call.argument("y");
+                    PointF pixel = new PointF(x.floatValue(), y.floatValue());
+                    features = vietmapGL.queryRenderedFeatures(pixel, filterExpression, layerIds);
+                } else {
+                    Double left = call.argument("left");
+                    Double top = call.argument("top");
+                    Double right = call.argument("right");
+                    Double bottom = call.argument("bottom");
+                    RectF rectF =
+                            new RectF(
+                                    left.floatValue(), top.floatValue(), right.floatValue(), bottom.floatValue());
+                    features = vietmapGL.queryRenderedFeatures(rectF, filterExpression, layerIds);
+                }
+                List<String> featuresJson = new ArrayList<>();
+                for (Feature feature : features) {
+                    featuresJson.add(feature.toJson());
+                }
+                reply.put("features", featuresJson);
+                result.success(reply);
+                break;
+            }
+            case "map#setTelemetryEnabled": {
+                result.success(null);
+                break;
+            }
+            case "map#getTelemetryEnabled": {
+                result.success(false);
+                break;
+            }
+            case "map#invalidateAmbientCache": {
+                OfflineManager fileSource = OfflineManager.Companion.getInstance(context);
+
+                fileSource.invalidateAmbientCache(
+                        new OfflineManager.FileSourceCallback() {
+                            @Override
+                            public void onSuccess() {
+                                result.success(null);
+                            }
+
+                            @Override
+                            public void onError(@NonNull String message) {
+                                result.error("MAPBOX CACHE ERROR", message, null);
+                            }
+                        });
+                break;
+            }
+            case "map#clearAmbientCache": {
+                OfflineManager fileSource = OfflineManager.Companion.getInstance(context);
+
+                fileSource.clearAmbientCache(
+                        new OfflineManager.FileSourceCallback() {
+                            @Override
+                            public void onSuccess() {
+                                result.success(null);
+                            }
+
+                            @Override
+                            public void onError(@NonNull String message) {
+                                result.error("MAPBOX CACHE ERROR", message, null);
+                            }
+                        });
+                break;
+            }
+            case "source#addGeoJson": {
+                if (style == null) {
+                    result.error(
+                            "STYLE IS NULL",
+                            "The style is null. Has onStyleLoaded() already been invoked?",
+                            null);
+                    break;
+                }
+                final String sourceId = call.argument("sourceId");
+                final String geojson = call.argument("geojson");
+                addGeoJsonSource(sourceId, geojson);
+                result.success(null);
+                break;
+            }
+
+            case "map#setStyle": {
+                styleStringInitial = call.argument("style");
+                vietmapGL.clear();
+                setStyleString(styleStringInitial);
+                result.success(null);
+                break;
+            }
+            case "source#setGeoJson": {
+                if (style == null) {
+                    result.error(
+                            "STYLE IS NULL",
+                            "The style is null. Has onStyleLoaded() already been invoked?",
+                            null);
+                    break;
+                }
+                final String sourceId = call.argument("sourceId");
+                final String geojson = call.argument("geojson");
+                setGeoJsonSource(sourceId, geojson);
+                result.success(null);
+                break;
+            }
+            case "source#setFeature": {
+                if (style == null) {
+                    result.error(
+                            "STYLE IS NULL",
+                            "The style is null. Has onStyleLoaded() already been invoked?",
+                            null);
+                    break;
+                }
+                final String sourceId = call.argument("sourceId");
+                final String geojsonFeature = call.argument("geojsonFeature");
+                setGeoJsonFeature(sourceId, geojsonFeature);
+                result.success(null);
+                break;
+            }
+            case "symbolLayer#add": {
+                final String sourceId = call.argument("sourceId");
+                final String layerId = call.argument("layerId");
+                final String belowLayerId = call.argument("belowLayerId");
+                final String sourceLayer = call.argument("sourceLayer");
+                final Double minzoom = call.argument("minzoom");
+                final Double maxzoom = call.argument("maxzoom");
+                final String filter = call.argument("filter");
+                final boolean enableInteraction = call.argument("enableInteraction");
+                final PropertyValue[] properties =
+                        LayerPropertyConverter.interpretSymbolLayerProperties(call.argument("properties"));
+
+                Expression filterExpression = parseFilter(filter);
+
+                addSymbolLayer(
+                        layerId,
+                        sourceId,
+                        belowLayerId,
+                        sourceLayer,
+                        minzoom != null ? minzoom.floatValue() : null,
+                        maxzoom != null ? maxzoom.floatValue() : null,
+                        properties,
+                        enableInteraction,
+                        filterExpression);
+                updateLocationComponentLayer();
+
+                result.success(null);
+                break;
+            }
+            case "lineLayer#add": {
+                final String sourceId = call.argument("sourceId");
+                final String layerId = call.argument("layerId");
+                final String belowLayerId = call.argument("belowLayerId");
+                final String sourceLayer = call.argument("sourceLayer");
+                final Double minzoom = call.argument("minzoom");
+                final Double maxzoom = call.argument("maxzoom");
+                final String filter = call.argument("filter");
+                final boolean enableInteraction = call.argument("enableInteraction");
+                final PropertyValue[] properties =
+                        LayerPropertyConverter.interpretLineLayerProperties(call.argument("properties"));
+
+                Expression filterExpression = parseFilter(filter);
+
+                addLineLayer(
+                        layerId,
+                        sourceId,
+                        belowLayerId,
+                        sourceLayer,
+                        minzoom != null ? minzoom.floatValue() : null,
+                        maxzoom != null ? maxzoom.floatValue() : null,
+                        properties,
+                        enableInteraction,
+                        filterExpression);
+                updateLocationComponentLayer();
+
+                result.success(null);
+                break;
+            }
+            case "camera#updateLayerProperties":
+                updateLayerProperties(call);
+                break;
+            case "layer#setProperties": {
+                final String layerId = call.argument("layerId");
+
+                if (style == null) {
+                    result.error(
+                            "STYLE IS NULL",
+                            "The style is null. Has onStyleLoaded() already been invoked?",
+                            null);
+                    break;
+                }
+
+                Layer layer = style.getLayer(layerId);
+
+                if (layer != null) {
+                    final PropertyValue[] properties;
+
+                    if (layer instanceof LineLayer) {
+                        properties = LayerPropertyConverter
+                                .interpretLineLayerProperties(call.argument("properties"));
+                    } else if (layer instanceof FillLayer) {
+                        properties = LayerPropertyConverter
+                                .interpretFillLayerProperties(call.argument("properties"));
+                    } else if (layer instanceof CircleLayer) {
+                        properties = LayerPropertyConverter
+                                .interpretCircleLayerProperties(call.argument("properties"));
+                    } else if (layer instanceof SymbolLayer) {
+                        properties = LayerPropertyConverter
+                                .interpretSymbolLayerProperties(call.argument("properties"));
+                    } else if (layer instanceof RasterLayer) {
+                        properties = LayerPropertyConverter
+                                .interpretRasterLayerProperties(call.argument("properties"));
+                    } else if (layer instanceof HillshadeLayer) {
+                        properties = LayerPropertyConverter
+                                .interpretHillshadeLayerProperties(call.argument("properties"));
+                    } else {
+                        result.error("UNSUPPORTED_LAYER_TYPE", "Layer type not supported", null);
+                        return;
+                    }
+                    layer.setProperties(properties);
+                    result.success(null);
+                } else {
+                    result.error("LAYER_NOT_FOUND_ERROR", "Layer " + layerId + "not found", null);
+                }
+
+                break;
+            }
+            case "fillLayer#add": {
+                final String sourceId = call.argument("sourceId");
+                final String layerId = call.argument("layerId");
+                final String belowLayerId = call.argument("belowLayerId");
+                final String sourceLayer = call.argument("sourceLayer");
+                final Double minzoom = call.argument("minzoom");
+                final Double maxzoom = call.argument("maxzoom");
+                final String filter = call.argument("filter");
+                final boolean enableInteraction = call.argument("enableInteraction");
+                final PropertyValue[] properties =
+                        LayerPropertyConverter.interpretFillLayerProperties(call.argument("properties"));
+
+                Expression filterExpression = parseFilter(filter);
+
+                addFillLayer(
+                        layerId,
+                        sourceId,
+                        belowLayerId,
+                        sourceLayer,
+                        minzoom != null ? minzoom.floatValue() : null,
+                        maxzoom != null ? maxzoom.floatValue() : null,
+                        properties,
+                        enableInteraction,
+                        filterExpression);
+                updateLocationComponentLayer();
+
+                result.success(null);
+                break;
+            }
+            case "fillExtrusionLayer#add": {
+                final String sourceId = call.argument("sourceId");
+                final String layerId = call.argument("layerId");
+                final String belowLayerId = call.argument("belowLayerId");
+                final String sourceLayer = call.argument("sourceLayer");
+                final Double minzoom = call.argument("minzoom");
+                final Double maxzoom = call.argument("maxzoom");
+                final String filter = call.argument("filter");
+                final boolean enableInteraction = call.argument("enableInteraction");
+                final PropertyValue[] properties =
+                        LayerPropertyConverter.interpretFillExtrusionLayerProperties(
+                                call.argument("properties"));
+
+                Expression filterExpression = parseFilter(filter);
+
+                addFillExtrusionLayer(
+                        layerId,
+                        sourceId,
+                        belowLayerId,
+                        sourceLayer,
+                        minzoom != null ? minzoom.floatValue() : null,
+                        maxzoom != null ? maxzoom.floatValue() : null,
+                        properties,
+                        enableInteraction,
+                        filterExpression);
+                updateLocationComponentLayer();
+
+                result.success(null);
+                break;
+            }
+            case "circleLayer#add": {
+                final String sourceId = call.argument("sourceId");
+                final String layerId = call.argument("layerId");
+                final String belowLayerId = call.argument("belowLayerId");
+                final String sourceLayer = call.argument("sourceLayer");
+                final Double minzoom = call.argument("minzoom");
+                final Double maxzoom = call.argument("maxzoom");
+                final String filter = call.argument("filter");
+                final boolean enableInteraction = call.argument("enableInteraction");
+                final PropertyValue[] properties =
+                        LayerPropertyConverter.interpretCircleLayerProperties(call.argument("properties"));
+
+                Expression filterExpression = parseFilter(filter);
+
+                addCircleLayer(
+                        layerId,
+                        sourceId,
+                        belowLayerId,
+                        sourceLayer,
+                        minzoom != null ? minzoom.floatValue() : null,
+                        maxzoom != null ? maxzoom.floatValue() : null,
+                        properties,
+                        enableInteraction,
+                        filterExpression);
+                updateLocationComponentLayer();
+
+                result.success(null);
+                break;
+            }
+            case "rasterLayer#add": {
+                final String sourceId = call.argument("sourceId");
+                final String layerId = call.argument("layerId");
+                final String belowLayerId = call.argument("belowLayerId");
+                final Double minzoom = call.argument("minzoom");
+                final Double maxzoom = call.argument("maxzoom");
+                final PropertyValue[] properties =
+                        LayerPropertyConverter.interpretRasterLayerProperties(call.argument("properties"));
+                addRasterLayer(
+                        layerId,
+                        sourceId,
+                        minzoom != null ? minzoom.floatValue() : null,
+                        maxzoom != null ? maxzoom.floatValue() : null,
+                        belowLayerId,
+                        properties,
+                        null);
+                updateLocationComponentLayer();
+
+                result.success(null);
+                break;
+            }
+            case "hillshadeLayer#add": {
+                final String sourceId = call.argument("sourceId");
+                final String layerId = call.argument("layerId");
+                final String belowLayerId = call.argument("belowLayerId");
+                final Double minzoom = call.argument("minzoom");
+                final Double maxzoom = call.argument("maxzoom");
+                final PropertyValue[] properties =
+                        LayerPropertyConverter.interpretHillshadeLayerProperties(call.argument("properties"));
+                addHillshadeLayer(
+                        layerId,
+                        sourceId,
+                        minzoom != null ? minzoom.floatValue() : null,
+                        maxzoom != null ? maxzoom.floatValue() : null,
+                        belowLayerId,
+                        properties,
+                        null);
+                updateLocationComponentLayer();
+
+                result.success(null);
+                break;
+            }
+            case "heatmapLayer#add": {
+                final String sourceId = call.argument("sourceId");
+                final String layerId = call.argument("layerId");
+                final String belowLayerId = call.argument("belowLayerId");
+                final Double minzoom = call.argument("minzoom");
+                final Double maxzoom = call.argument("maxzoom");
+                final PropertyValue[] properties =
+                        LayerPropertyConverter.interpretHeatmapLayerProperties(call.argument("properties"));
+                addHeatmapLayer(
+                        layerId,
+                        sourceId,
+                        minzoom != null ? minzoom.floatValue() : null,
+                        maxzoom != null ? maxzoom.floatValue() : null,
+                        belowLayerId,
+                        properties,
+                        null);
+                updateLocationComponentLayer();
+
+                result.success(null);
+                break;
+            }
+            case "locationComponent#getLastLocation": {
+                if (this.myLocationEnabled
+                        && locationComponent != null
+                        && locationComponent.isLocationComponentActivated()
+                        && locationComponent.getLocationEngine() != null) {
+                    Map<String, Object> reply = new HashMap<>();
+
+                    vietmapGL.getLocationComponent().getLocationEngine().getLastLocation(
+                            new LocationEngineCallback<LocationEngineResult>() {
+                                @Override
+                                public void onSuccess(LocationEngineResult locationEngineResult) {
+                                    Location lastLocation = locationEngineResult.getLastLocation();
+                                    if (lastLocation != null) {
+                                        reply.put("latitude", lastLocation.getLatitude());
+                                        reply.put("longitude", lastLocation.getLongitude());
+                                        reply.put("altitude", lastLocation.getAltitude());
+                                        result.success(reply);
+                                    } else {
+                                        // No fix yet - not an error, the caller retries.
+                                        result.success(null);
+                                    }
+                                }
+
+                                @Override
+                                public void onFailure(@NonNull Exception exception) {
+                                    Log.w(TAG, "getLastLocation failed", exception);
+                                    result.success(null);
+                                }
+                            });
+                } else {
+                    // Reached on every map creation: the platform view is ready (and
+                    // Dart already has its controller) a good while before
+                    // onStyleLoaded builds the location component. Without this
+                    // branch `result` is never fulfilled and the Dart side awaits
+                    // forever. Report "no location yet" rather than an error so the
+                    // caller can simply try again later.
+                    result.success(null);
+                }
+                break;
+            }
+            case "style#addImage": {
+                if (style == null) {
+                    result.error(
+                            "STYLE IS NULL",
+                            "The style is null. Has onStyleLoaded() already been invoked?",
+                            null);
+                    break;
+                }
+                // Pin the decode densities so Style.toImage() computes a pixelRatio
+                // of 1.0 on every device. Without this the bitmap is scaled by
+                // screenDensity/160 (3.0 on xxxhdpi) and the icon renders oversized.
+                BitmapFactory.Options addImageOptions = new BitmapFactory.Options();
+                addImageOptions.inScaled = false;
+                addImageOptions.inDensity = DisplayMetrics.DENSITY_DEFAULT;
+                addImageOptions.inTargetDensity = DisplayMetrics.DENSITY_DEFAULT;
+                Bitmap addImageBitmap =
+                        BitmapFactory.decodeByteArray(
+                                call.argument("bytes"), 0, call.argument("length"), addImageOptions);
+                if (addImageBitmap == null) {
+                    result.error("INVALID_IMAGE", "Failed to decode image bytes.", null);
+                    break;
+                }
+                style.addImage(call.argument("name"), addImageBitmap, call.argument("sdf"));
+                result.success(null);
+                break;
+            }
+            case "style#addImageSource": {
+                if (style == null) {
+                    result.error(
+                            "STYLE IS NULL",
+                            "The style is null. Has onStyleLoaded() already been invoked?",
+                            null);
+                    break;
+                }
+                List<LatLng> coordinates = Convert.toLatLngList(call.argument("coordinates"), false);
+                Bitmap addSourceBitmap =
+                        BitmapFactory.decodeByteArray(
+                                call.argument("bytes"), 0, call.argument("length"));
+                if (addSourceBitmap == null) {
+                    result.error("INVALID_IMAGE", "Failed to decode image bytes.", null);
+                    break;
+                }
+                style.addSource(
+                        new ImageSource(
+                                call.argument("imageSourceId"),
+                                new LatLngQuad(
+                                        coordinates.get(0),
+                                        coordinates.get(1),
+                                        coordinates.get(2),
+                                        coordinates.get(3)),
+                                addSourceBitmap));
+                result.success(null);
+                break;
+            }
+            case "style#updateImageSource": {
+                if (style == null) {
+                    result.error(
+                            "STYLE IS NULL",
+                            "The style is null. Has onStyleLoaded() already been invoked?",
+                            null);
+                    break;
+                }
+                ImageSource imageSource = style.getSourceAs(call.argument("imageSourceId"));
+                List<LatLng> coordinates = Convert.toLatLngList(call.argument("coordinates"), false);
+                if (coordinates != null) {
+                    imageSource.setCoordinates(
+                            new LatLngQuad(
+                                    coordinates.get(0),
+                                    coordinates.get(1),
+                                    coordinates.get(2),
+                                    coordinates.get(3)));
+                }
+                byte[] bytes = call.argument("bytes");
+                if (bytes != null) {
+                    Bitmap updateBitmap =
+                            BitmapFactory.decodeByteArray(bytes, 0, call.argument("length"));
+                    if (updateBitmap == null) {
+                        result.error("INVALID_IMAGE", "Failed to decode image bytes.", null);
+                        break;
+                    }
+                    imageSource.setImage(updateBitmap);
+                }
+                result.success(null);
+                break;
+            }
+            case "style#addSource": {
+                final String id = Convert.toString(call.argument("sourceId"));
+                final Map<String, Object> properties = (Map<String, Object>) call.argument("properties");
+                SourcePropertyConverter.addSource(id, properties, style);
+                result.success(null);
+                break;
+            }
+
+            case "style#removeSource": {
+                if (style == null) {
+                    result.error(
+                            "STYLE IS NULL",
+                            "The style is null. Has onStyleLoaded() already been invoked?",
+                            null);
+                    break;
+                }
+                style.removeSource((String) call.argument("sourceId"));
+                result.success(null);
+                break;
+            }
+            case "style#addLayer": {
+                if (style == null) {
+                    result.error(
+                            "STYLE IS NULL",
+                            "The style is null. Has onStyleLoaded() already been invoked?",
+                            null);
+                    break;
+                }
+                addRasterLayer(
+                        call.argument("imageLayerId"),
+                        call.argument("imageSourceId"),
+                        call.argument("minzoom") != null
+                                ? ((Double) call.argument("minzoom")).floatValue()
+                                : null,
+                        call.argument("maxzoom") != null
+                                ? ((Double) call.argument("maxzoom")).floatValue()
+                                : null,
+                        null,
+                        new PropertyValue[]{},
+                        null);
+                result.success(null);
+                break;
+            }
+            case "style#addLayerBelow": {
+                if (style == null) {
+                    result.error(
+                            "STYLE IS NULL",
+                            "The style is null. Has onStyleLoaded() already been invoked?",
+                            null);
+                    break;
+                }
+                addRasterLayer(
+                        call.argument("imageLayerId"),
+                        call.argument("imageSourceId"),
+                        call.argument("minzoom") != null
+                                ? ((Double) call.argument("minzoom")).floatValue()
+                                : null,
+                        call.argument("maxzoom") != null
+                                ? ((Double) call.argument("maxzoom")).floatValue()
+                                : null,
+                        call.argument("belowLayerId"),
+                        new PropertyValue[]{},
+                        null);
+                result.success(null);
+                break;
+            }
+            case "style#removeLayer": {
+                if (style == null) {
+                    result.error(
+                            "STYLE IS NULL",
+                            "The style is null. Has onStyleLoaded() already been invoked?",
+                            null);
+                    break;
+                }
+                String layerId = call.argument("layerId");
+                style.removeLayer(layerId);
+                interactiveFeatureLayerIds.remove(layerId);
+
+                result.success(null);
+                break;
+            }
+            case "map#setCameraBounds": {
+                double west = call.argument("west");
+                double north = call.argument("north");
+                double south = call.argument("south");
+                double east = call.argument("east");
+
+                int padding = call.argument("padding");
+
+                LatLng locationOne = new LatLng(north, east);
+                LatLng locationTwo = new LatLng(south, west);
+                LatLngBounds latLngBounds = new LatLngBounds.Builder()
+                        .include(locationOne) // Northeast
+                        .include(locationTwo) // Southwest
+                        .build();
+                vietmapGL.easeCamera(CameraUpdateFactory.newLatLngBounds(latLngBounds,
+                        padding), 200);
+
+                break;
+            }
+            case "style#setFilter": {
+                if (style == null) {
+                    result.error(
+                            "STYLE IS NULL",
+                            "The style is null. Has onStyleLoaded() already been invoked?",
+                            null);
+                    break;
+                }
+                String layerId = call.argument("layerId");
+                String filter = call.argument("filter");
+
+                Layer layer = style.getLayer(layerId);
+
+                JsonParser parser = new JsonParser();
+                JsonElement jsonElement = parser.parse(filter);
+                Expression expression = Expression.Converter.convert(jsonElement);
+
+                if (layer instanceof CircleLayer) {
+                    ((CircleLayer) layer).setFilter(expression);
+                } else if (layer instanceof FillExtrusionLayer) {
+                    ((FillExtrusionLayer) layer).setFilter(expression);
+                } else if (layer instanceof FillLayer) {
+                    ((FillLayer) layer).setFilter(expression);
+                } else if (layer instanceof HeatmapLayer) {
+                    ((HeatmapLayer) layer).setFilter(expression);
+                } else if (layer instanceof LineLayer) {
+                    ((LineLayer) layer).setFilter(expression);
+                } else if (layer instanceof SymbolLayer) {
+                    ((SymbolLayer) layer).setFilter(expression);
+                } else {
+                    result.error(
+                            "INVALID LAYER TYPE",
+                            String.format("Layer '%s' does not support filtering.", layerId),
+                            null);
+                    break;
+                }
+
+                result.success(null);
+                break;
+            }
+            case "style#getFilter": {
+                if (style == null) {
+                    result.error(
+                            "STYLE IS NULL",
+                            "The style is null. Has onStyleLoaded() already been invoked?",
+                            null);
+                    break;
+                }
+                Map<String, Object> reply = new HashMap<>();
+                String layerId = call.argument("layerId");
+                Layer layer = style.getLayer(layerId);
+
+                Expression filter;
+                if (layer instanceof CircleLayer) {
+                    filter = ((CircleLayer) layer).getFilter();
+                } else if (layer instanceof FillExtrusionLayer) {
+                    filter = ((FillExtrusionLayer) layer).getFilter();
+                } else if (layer instanceof FillLayer) {
+                    filter = ((FillLayer) layer).getFilter();
+                } else if (layer instanceof HeatmapLayer) {
+                    filter = ((HeatmapLayer) layer).getFilter();
+                } else if (layer instanceof LineLayer) {
+                    filter = ((LineLayer) layer).getFilter();
+                } else if (layer instanceof SymbolLayer) {
+                    filter = ((SymbolLayer) layer).getFilter();
+                } else {
+                    result.error(
+                            "INVALID LAYER TYPE",
+                            String.format("Layer '%s' does not support filtering.", layerId),
+                            null);
+                    break;
+                }
+
+                reply.put("filter", filter.toString());
+                result.success(reply);
+                break;
+            }
+            case "layer#setVisibility": {
+
+                if (style == null) {
+                    result.error(
+                            "STYLE IS NULL",
+                            "The style is null. Has onStyleLoaded() already been invoked?",
+                            null);
+                    break;
+                }
+                String layerId = call.argument("layerId");
+                boolean visible = call.argument("visible");
+
+                Layer layer = style.getLayer(layerId);
+
+                if (layer != null) {
+                    layer.setProperties(PropertyFactory.visibility(visible ? Property.VISIBLE : Property.NONE));
+                }
+
+                result.success(null);
+                break;
+
+            }
+            case "map#querySourceFeatures": {
+                Map<String, Object> reply = new HashMap<>();
+                List<Feature> features;
+
+                String sourceId = (String) call.argument("sourceId");
+
+                String sourceLayerId = (String) call.argument("sourceLayerId");
+
+                List<Object> filter = call.argument("filter");
+                JsonElement jsonElement = filter == null ? null : new Gson().toJsonTree(filter);
+                JsonArray jsonArray = null;
+                if (jsonElement != null && jsonElement.isJsonArray()) {
+                    jsonArray = jsonElement.getAsJsonArray();
+                }
+                Expression filterExpression =
+                        jsonArray == null ? null : Expression.Converter.convert(jsonArray);
+
+
+                Source source = style.getSource(sourceId);
+                if (source instanceof GeoJsonSource) {
+                    features = ((GeoJsonSource) source).querySourceFeatures(filterExpression);
+                } else if (source instanceof CustomGeometrySource) {
+                    features = ((CustomGeometrySource) source).querySourceFeatures(filterExpression);
+                } else if (source instanceof VectorSource && sourceLayerId != null) {
+                    features = ((VectorSource) source).querySourceFeatures(new String[]{sourceLayerId}, filterExpression);
+                } else {
+                    features = Collections.emptyList();
+                }
+
+                List<String> featuresJson = new ArrayList<>();
+                for (Feature feature : features) {
+                    featuresJson.add(feature.toJson());
+                }
+                reply.put("features", featuresJson);
+                result.success(reply);
+                break;
+            }
+            case "style#getLayerIds": {
+                if (style == null) {
+                    result.error(
+                            "STYLE IS NULL",
+                            "The style is null. Has onStyleLoaded() already been invoked?",
+                            null);
+                    break;
+                }
+                Map<String, Object> reply = new HashMap<>();
+
+                List<String> layerIds = new ArrayList<>();
+                for (Layer layer : style.getLayers()) {
+                    layerIds.add(layer.getId());
+                }
+
+                reply.put("layers", layerIds);
+                result.success(reply);
+                break;
+            }
+            case "style#getSourceIds": {
+                if (style == null) {
+                    result.error(
+                            "STYLE IS NULL",
+                            "The style is null. Has onStyleLoaded() already been invoked?",
+                            null);
+                    break;
+                }
+                Map<String, Object> reply = new HashMap<>();
+
+                List<String> sourceIds = new ArrayList<>();
+                for (Source source : style.getSources()) {
+                    sourceIds.add(source.getId());
+                }
+
+                reply.put("sources", sourceIds);
+                result.success(reply);
+                break;
+            }
+            case "map#takeSnapshot": {
+                if (vietmapGL == null) {
+                    result.error("MAP_NOT_READY", "Map is not ready", null);
+                    break;
+                }
+                String snapshotStyleUrl =
+                        vietmapGL.getStyle() != null ? vietmapGL.getStyle().getUri() : null;
+                if (snapshotStyleUrl == null) {
+                    result.error("STYLE_NOT_READY", "Map style is not loaded", null);
+                    break;
+                }
+                Integer snapshotWidthArg = call.argument("width");
+                Integer snapshotHeightArg = call.argument("height");
+                int snapshotWidth = snapshotWidthArg != null ? snapshotWidthArg : mapView.getWidth();
+                int snapshotHeight = snapshotHeightArg != null ? snapshotHeightArg : mapView.getHeight();
+                if (snapshotWidth <= 0 || snapshotHeight <= 0) {
+                    result.error(
+                            "SNAPSHOT_ERROR", "Invalid snapshot size " + snapshotWidth + "x" + snapshotHeight, null);
+                    break;
+                }
+
+                MapSnapshotter.Options snapshotOptions =
+                        new MapSnapshotter.Options(snapshotWidth, snapshotHeight)
+                                .withStyle(snapshotStyleUrl)
+                                .withCameraPosition(vietmapGL.getCameraPosition());
+                if (activeSnapshotter != null) {
+                    activeSnapshotter.cancel();
+                }
+                activeSnapshotter = new MapSnapshotter(context, snapshotOptions);
+                activeSnapshotter.start(
+                        new MapSnapshotter.SnapshotReadyCallback() {
+                            @Override
+                            public void onSnapshotReady(MapSnapshot snapshot) {
+                                activeSnapshotter = null;
+                                Bitmap bitmap = snapshot.getBitmap();
+                                ByteArrayOutputStream stream = new ByteArrayOutputStream();
+                                bitmap.compress(Bitmap.CompressFormat.PNG, 100, stream);
+                                result.success(stream.toByteArray());
+                            }
+                        },
+                        new MapSnapshotter.ErrorHandler() {
+                            @Override
+                            public void onError(String error) {
+                                activeSnapshotter = null;
+                                result.error("SNAPSHOT_ERROR", error, null);
+                            }
+                        });
+                break;
+            }
+            default:
+                result.notImplemented();
+        }
+    }
+
+    @Override
+    public void onCameraMoveStarted(int reason) {
+        final Map<String, Object> arguments = new HashMap<>(2);
+        boolean isGesture = reason == VietMapGL.OnCameraMoveStartedListener.REASON_API_GESTURE;
+        arguments.put("isGesture", isGesture);
+        methodChannel.invokeMethod("camera#onMoveStarted", arguments);
+    }
+
+    @Override
+    public void onCameraMove() {
+        if (!trackCameraPosition) {
+            return;
+        }
+        final Map<String, Object> arguments = new HashMap<>(2);
+        arguments.put("position", Convert.toJson(vietmapGL.getCameraPosition()));
+        methodChannel.invokeMethod("camera#onMove", arguments);
+    }
+
+    @Override
+    public void onCameraIdle() {
+        final Map<String, Object> arguments = new HashMap<>(2);
+        if (trackCameraPosition) {
+            arguments.put("position", Convert.toJson(vietmapGL.getCameraPosition()));
+        }
+        methodChannel.invokeMethod("camera#onIdle", arguments);
+    }
+
+    @Override
+    public void onCameraTrackingChanged(int currentMode) {
+        final Map<String, Object> arguments = new HashMap<>(2);
+        switch (currentMode) {
+            case CameraMode.NONE:
+                arguments.put("mode", 0);
+                break;
+            case CameraMode.TRACKING:
+                arguments.put("mode", 1);
+                break;
+            case CameraMode.TRACKING_COMPASS:
+                arguments.put("mode", 2);
+                break;
+            case CameraMode.TRACKING_GPS:
+                arguments.put("mode", 3);
+                break;
+            default:
+                Log.e(TAG, "Unable to map " + currentMode + " to a tracking mode");
+                return;
+        }
+
+        methodChannel.invokeMethod("map#onCameraTrackingChanged", arguments);
+    }
+
+    @Override
+    public void onCameraTrackingDismissed() {
+        this.myLocationTrackingMode = 0;
+        methodChannel.invokeMethod("map#onCameraTrackingDismissed", new HashMap<>());
+    }
+
+    @Override
+    public void onDidBecomeIdle() {
+        methodChannel.invokeMethod("map#onIdle", new HashMap<>());
+    }
+
+    @Override
+    public boolean onMapClick(@NonNull LatLng point) {
+        PointF pointf = vietmapGL.getProjection().toScreenLocation(point);
+        RectF rectF = new RectF(pointf.x - 10, pointf.y - 10, pointf.x + 10, pointf.y + 10);
+        Pair<Feature, String> featureLayerPair = firstFeatureOnLayers(rectF);
+        final Map<String, Object> arguments = new HashMap<>();
+        arguments.put("x", pointf.x);
+        arguments.put("y", pointf.y);
+        arguments.put("lng", point.getLongitude());
+        arguments.put("lat", point.getLatitude());
+        if (featureLayerPair != null && featureLayerPair.first != null) {
+            arguments.put("layerId", featureLayerPair.second);
+            arguments.put("id", featureLayerPair.first.id());
+            methodChannel.invokeMethod("feature#onTap", arguments);
+        } else {
+            methodChannel.invokeMethod("map#onMapClick", arguments);
+        }
+        return true;
+    }
+
+    @Override
+    public boolean onMapLongClick(@NonNull LatLng point) {
+        PointF pointf = vietmapGL.getProjection().toScreenLocation(point);
+        final Map<String, Object> arguments = new HashMap<>(5);
+        arguments.put("x", pointf.x);
+        arguments.put("y", pointf.y);
+        arguments.put("lng", point.getLongitude());
+        arguments.put("lat", point.getLatitude());
+        methodChannel.invokeMethod("map#onMapLongClick", arguments);
+        return true;
+    }
+
+    @Override
+    public void dispose() {
+        if (disposed) {
+            return;
+        }
+        disposed = true;
+        methodChannel.setMethodCallHandler(null);
+        destroyMapViewIfNecessary();
+        Lifecycle lifecycle = lifecycleProvider.getLifecycle();
+        if (lifecycle != null) {
+            lifecycle.removeObserver(this);
+        }
+    }
+
+    private void moveCamera(CameraUpdate cameraUpdate, MethodChannel.Result result) {
+        if (cameraUpdate != null) {
             // camera transformation not handled yet
             vietmapGL.moveCamera(
-                cameraUpdate,
-                new OnCameraMoveFinishedListener() {
-                  @Override
-                  public void onFinish() {
-                    super.onFinish();
-                    result.success(true);
-                  }
+                    cameraUpdate,
+                    new OnCameraMoveFinishedListener() {
+                        @Override
+                        public void onFinish() {
+                            super.onFinish();
+                            result.success(true);
+                        }
 
-                  @Override
-                  public void onCancel() {
-                    super.onCancel();
-                    result.success(false);
-                  }
-                });
+                        @Override
+                        public void onCancel() {
+                            super.onCancel();
+                            result.success(false);
+                        }
+                    });
 
             // moveCamera(cameraUpdate);
-          } else {
+        } else {
             result.success(false);
-          }
-          break;
         }
-      case "camera#animate":
-        {
-          final CameraUpdate cameraUpdate =
-              Convert.toCameraUpdate(call.argument("cameraUpdate"), vietmapGL, density);
-          final Integer duration = call.argument("duration");
+    }
 
-          final OnCameraMoveFinishedListener onCameraMoveFinishedListener =
-              new OnCameraMoveFinishedListener() {
-                @Override
-                public void onFinish() {
-                  super.onFinish();
-                  result.success(true);
-                }
+    private void animateCamera(
+            CameraUpdate cameraUpdate, Integer duration, MethodChannel.Result result) {
+        final OnCameraMoveFinishedListener onCameraMoveFinishedListener =
+                new OnCameraMoveFinishedListener() {
+                    @Override
+                    public void onFinish() {
+                        super.onFinish();
+                        result.success(true);
+                    }
 
-                @Override
-                public void onCancel() {
-                  super.onCancel();
-                  result.success(false);
-                }
-              };
-          if (cameraUpdate != null && duration != null) {
+                    @Override
+                    public void onCancel() {
+                        super.onCancel();
+                        result.success(false);
+                    }
+                };
+        if (cameraUpdate != null && duration != null) {
             // camera transformation not handled yet
             vietmapGL.animateCamera(cameraUpdate, duration, onCameraMoveFinishedListener);
-          } else if (cameraUpdate != null) {
+        } else if (cameraUpdate != null) {
             // camera transformation not handled yet
             vietmapGL.animateCamera(cameraUpdate, onCameraMoveFinishedListener);
-          } else {
+        } else {
             result.success(false);
-          }
-          break;
         }
-      case "map#updateUserLocationLayerIcon": {
-        isCustomizeLocationMarker = call.argument("isEnable");
-        if (vietmapGL != null) {
-          updateMyLocationEnabled();
-        }
-      }
-      case "map#updateLogoEnabled":
-        {
-          logoEnabled = call.argument("isEnable");
-          updateLogoEnabled();
-        }
-      case "map#queryRenderedFeatures":
-        {
-          Map<String, Object> reply = new HashMap<>();
-          List<com.mapbox.geojson.Feature> features;
-          if(!call.hasArgument("layerIds")) return;
-
-          String[] layerIds = ((List<String>) call.argument("layerIds")).toArray(new String[0]);
-
-          List<Object> filter = call.argument("filter");
-          JsonElement jsonElement = filter == null ? null : new Gson().toJsonTree(filter);
-          JsonArray jsonArray = null;
-          if (jsonElement != null && jsonElement.isJsonArray()) {
-            jsonArray = jsonElement.getAsJsonArray();
-          }
-          Expression filterExpression =
-              jsonArray == null ? null : Expression.Converter.convert(jsonArray);
-          if (call.hasArgument("x")) {
-            Double x = call.argument("x");
-            Double y = call.argument("y");
-            PointF pixel = new PointF(x.floatValue(), y.floatValue());
-            features = vietmapGL.queryRenderedFeatures(pixel, filterExpression, layerIds);
-          } else {
-            Double left = call.argument("left");
-            Double top = call.argument("top");
-            Double right = call.argument("right");
-            Double bottom = call.argument("bottom");
-            RectF rectF =
-                new RectF(
-                    left.floatValue(), top.floatValue(), right.floatValue(), bottom.floatValue());
-            features = vietmapGL.queryRenderedFeatures(rectF, filterExpression, layerIds);
-          }
-          List<String> featuresJson = new ArrayList<>();
-          for (Feature feature : features) {
-            featuresJson.add(feature.toJson());
-          }
-          reply.put("features", featuresJson);
-          result.success(reply);
-          break;
-        }
-      case "map#setTelemetryEnabled":
-        {
-          result.success(null);
-          break;
-        }
-      case "map#getTelemetryEnabled":
-        {
-          result.success(false);
-          break;
-        }
-      case "map#invalidateAmbientCache":
-        {
-          OfflineManager fileSource = OfflineManager.Companion.getInstance(context);
-
-          fileSource.invalidateAmbientCache(
-              new OfflineManager.FileSourceCallback() {
-                @Override
-                public void onSuccess() {
-                  result.success(null);
-                }
-
-                @Override
-                public void onError(@NonNull String message) {
-                  result.error("MAPBOX CACHE ERROR", message, null);
-                }
-              });
-          break;
-        }
-      case "map#clearAmbientCache":
-      {
-        OfflineManager fileSource = OfflineManager.Companion.getInstance(context);
-
-        fileSource.clearAmbientCache(
-                new OfflineManager.FileSourceCallback() {
-                  @Override
-                  public void onSuccess() {
-                    result.success(null);
-                  }
-
-                  @Override
-                  public void onError(@NonNull String message) {
-                    result.error("MAPBOX CACHE ERROR", message, null);
-                  }
-                });
-        break;
-      }
-      case "source#addGeoJson":
-        {
-          final String sourceId = call.argument("sourceId");
-          final String geojson = call.argument("geojson");
-          addGeoJsonSource(sourceId, geojson);
-          result.success(null);
-          break;
-        }
-
-      case "map#setStyle": 
-        {
-          styleStringInitial = call.argument("style");
-          vietmapGL.clear();
-          setStyleString(styleStringInitial);
-        }
-      case "source#setGeoJson":
-        {
-          final String sourceId = call.argument("sourceId");
-          final String geojson = call.argument("geojson");
-          setGeoJsonSource(sourceId, geojson);
-          result.success(null);
-          break;
-        }
-      case "source#setFeature":
-        {
-          final String sourceId = call.argument("sourceId");
-          final String geojsonFeature = call.argument("geojsonFeature");
-          setGeoJsonFeature(sourceId, geojsonFeature);
-          result.success(null);
-          break;
-        }
-      case "symbolLayer#add":
-        {
-          final String sourceId = call.argument("sourceId");
-          final String layerId = call.argument("layerId");
-          final String belowLayerId = call.argument("belowLayerId");
-          final String sourceLayer = call.argument("sourceLayer");
-          final Double minzoom = call.argument("minzoom");
-          final Double maxzoom = call.argument("maxzoom");
-          final String filter = call.argument("filter");
-          final boolean enableInteraction = call.argument("enableInteraction");
-          final PropertyValue[] properties =
-              LayerPropertyConverter.interpretSymbolLayerProperties(call.argument("properties"));
-
-          Expression filterExpression = parseFilter(filter);
-
-          addSymbolLayer(
-              layerId,
-              sourceId,
-              belowLayerId,
-              sourceLayer,
-              minzoom != null ? minzoom.floatValue() : null,
-              maxzoom != null ? maxzoom.floatValue() : null,
-              properties,
-              enableInteraction,
-              filterExpression);
-          updateLocationComponentLayer();
-
-          result.success(null);
-          break;
-        }
-      case "lineLayer#add":
-        {
-          final String sourceId = call.argument("sourceId");
-          final String layerId = call.argument("layerId");
-          final String belowLayerId = call.argument("belowLayerId");
-          final String sourceLayer = call.argument("sourceLayer");
-          final Double minzoom = call.argument("minzoom");
-          final Double maxzoom = call.argument("maxzoom");
-          final String filter = call.argument("filter");
-          final boolean enableInteraction = call.argument("enableInteraction");
-          final PropertyValue[] properties =
-              LayerPropertyConverter.interpretLineLayerProperties(call.argument("properties"));
-
-          Expression filterExpression = parseFilter(filter);
-
-          addLineLayer(
-              layerId,
-              sourceId,
-              belowLayerId,
-              sourceLayer,
-              minzoom != null ? minzoom.floatValue() : null,
-              maxzoom != null ? maxzoom.floatValue() : null,
-              properties,
-              enableInteraction,
-              filterExpression);
-          updateLocationComponentLayer();
-
-          result.success(null);
-          break;
-        }
-        case "camera#updateLayerProperties":
-          updateLayerProperties(call);
-          break;
-        case "layer#setProperties": {
-          final String layerId = call.argument("layerId");
-
-          if (style == null) {
-            result.error(
-                "STYLE IS NULL",
-                "The style is null. Has onStyleLoaded() already been invoked?",
-                null);
-          }
-
-          Layer layer = style.getLayer(layerId);
-
-          if (layer != null) {
-            final PropertyValue[] properties;
-
-            if (layer instanceof LineLayer) {
-              properties = LayerPropertyConverter
-                  .interpretLineLayerProperties(call.argument("properties"));
-            } else if (layer instanceof FillLayer) {
-              properties = LayerPropertyConverter
-                  .interpretFillLayerProperties(call.argument("properties"));
-            } else if (layer instanceof CircleLayer) {
-              properties = LayerPropertyConverter
-                  .interpretCircleLayerProperties(call.argument("properties"));
-            } else if (layer instanceof SymbolLayer) {
-              properties = LayerPropertyConverter
-                  .interpretSymbolLayerProperties(call.argument("properties"));
-            } else if (layer instanceof RasterLayer) {
-              properties = LayerPropertyConverter
-                  .interpretRasterLayerProperties(call.argument("properties"));
-            } else if (layer instanceof HillshadeLayer) {
-              properties = LayerPropertyConverter
-                  .interpretHillshadeLayerProperties(call.argument("properties"));
-            } else {
-              result.error("UNSUPPORTED_LAYER_TYPE", "Layer type not supported", null);
-              return;
-            }
-            layer.setProperties(properties);
-            result.success(null);
-          } else {
-            result.error("LAYER_NOT_FOUND_ERROR", "Layer " + layerId + "not found", null);
-          }
-
-          break;
-        }
-      case "fillLayer#add":
-        {
-          final String sourceId = call.argument("sourceId");
-          final String layerId = call.argument("layerId");
-          final String belowLayerId = call.argument("belowLayerId");
-          final String sourceLayer = call.argument("sourceLayer");
-          final Double minzoom = call.argument("minzoom");
-          final Double maxzoom = call.argument("maxzoom");
-          final String filter = call.argument("filter");
-          final boolean enableInteraction = call.argument("enableInteraction");
-          final PropertyValue[] properties =
-              LayerPropertyConverter.interpretFillLayerProperties(call.argument("properties"));
-
-          Expression filterExpression = parseFilter(filter);
-
-          addFillLayer(
-              layerId,
-              sourceId,
-              belowLayerId,
-              sourceLayer,
-              minzoom != null ? minzoom.floatValue() : null,
-              maxzoom != null ? maxzoom.floatValue() : null,
-              properties,
-              enableInteraction,
-              filterExpression);
-          updateLocationComponentLayer();
-
-          result.success(null);
-          break;
-        }
-      case "fillExtrusionLayer#add":
-      {
-        final String sourceId = call.argument("sourceId");
-        final String layerId = call.argument("layerId");
-        final String belowLayerId = call.argument("belowLayerId");
-        final String sourceLayer = call.argument("sourceLayer");
-        final Double minzoom = call.argument("minzoom");
-        final Double maxzoom = call.argument("maxzoom");
-        final String filter = call.argument("filter");
-        final boolean enableInteraction = call.argument("enableInteraction");
-        final PropertyValue[] properties =
-                LayerPropertyConverter.interpretFillExtrusionLayerProperties(
-                        call.argument("properties"));
-
-        Expression filterExpression = parseFilter(filter);
-
-        addFillExtrusionLayer(
-                layerId,
-                sourceId,
-                belowLayerId,
-                sourceLayer,
-                minzoom != null ? minzoom.floatValue() : null,
-                maxzoom != null ? maxzoom.floatValue() : null,
-                properties,
-                enableInteraction,
-                filterExpression);
-        updateLocationComponentLayer();
-
-        result.success(null);
-        break;
-      }
-      case "circleLayer#add":
-        {
-          final String sourceId = call.argument("sourceId");
-          final String layerId = call.argument("layerId");
-          final String belowLayerId = call.argument("belowLayerId");
-          final String sourceLayer = call.argument("sourceLayer");
-          final Double minzoom = call.argument("minzoom");
-          final Double maxzoom = call.argument("maxzoom");
-          final String filter = call.argument("filter");
-          final boolean enableInteraction = call.argument("enableInteraction");
-          final PropertyValue[] properties =
-              LayerPropertyConverter.interpretCircleLayerProperties(call.argument("properties"));
-
-          Expression filterExpression = parseFilter(filter);
-
-          addCircleLayer(
-              layerId,
-              sourceId,
-              belowLayerId,
-              sourceLayer,
-              minzoom != null ? minzoom.floatValue() : null,
-              maxzoom != null ? maxzoom.floatValue() : null,
-              properties,
-              enableInteraction,
-              filterExpression);
-          updateLocationComponentLayer();
-
-          result.success(null);
-          break;
-        }
-      case "rasterLayer#add":
-        {
-          final String sourceId = call.argument("sourceId");
-          final String layerId = call.argument("layerId");
-          final String belowLayerId = call.argument("belowLayerId");
-          final Double minzoom = call.argument("minzoom");
-          final Double maxzoom = call.argument("maxzoom");
-          final PropertyValue[] properties =
-              LayerPropertyConverter.interpretRasterLayerProperties(call.argument("properties"));
-          addRasterLayer(
-              layerId,
-              sourceId,
-              minzoom != null ? minzoom.floatValue() : null,
-              maxzoom != null ? maxzoom.floatValue() : null,
-              belowLayerId,
-              properties,
-              null);
-          updateLocationComponentLayer();
-
-          result.success(null);
-          break;
-        }
-      case "hillshadeLayer#add":
-        {
-          final String sourceId = call.argument("sourceId");
-          final String layerId = call.argument("layerId");
-          final String belowLayerId = call.argument("belowLayerId");
-          final Double minzoom = call.argument("minzoom");
-          final Double maxzoom = call.argument("maxzoom");
-          final PropertyValue[] properties =
-              LayerPropertyConverter.interpretHillshadeLayerProperties(call.argument("properties"));
-          addHillshadeLayer(
-              layerId,
-              sourceId,
-              minzoom != null ? minzoom.floatValue() : null,
-              maxzoom != null ? maxzoom.floatValue() : null,
-              belowLayerId,
-              properties,
-              null);
-          updateLocationComponentLayer();
-
-          result.success(null);
-          break;
-        }
-      case "heatmapLayer#add":
-        {
-          final String sourceId = call.argument("sourceId");
-          final String layerId = call.argument("layerId");
-          final String belowLayerId = call.argument("belowLayerId");
-          final Double minzoom = call.argument("minzoom");
-          final Double maxzoom = call.argument("maxzoom");
-          final PropertyValue[] properties =
-              LayerPropertyConverter.interpretHeatmapLayerProperties(call.argument("properties"));
-          addHeatmapLayer(
-              layerId,
-              sourceId,
-              minzoom != null ? minzoom.floatValue() : null,
-              maxzoom != null ? maxzoom.floatValue() : null,
-              belowLayerId,
-              properties,
-              null);
-          updateLocationComponentLayer();
-
-          result.success(null);
-          break;
-        }
-      case "locationComponent#getLastLocation":
-        {
-          Log.e(TAG, "location component: getLastLocation");
-          if (this.myLocationEnabled && locationComponent != null&& locationComponent.isLocationComponentActivated()) {
-            Map<String, Object> reply = new HashMap<>();
-
-            vietmapGL.getLocationComponent().getLocationEngine().getLastLocation(
-                new LocationEngineCallback<LocationEngineResult>() {
-                  @Override
-                  public void onSuccess(LocationEngineResult locationEngineResult) {
-                    Location lastLocation = locationEngineResult.getLastLocation();
-                    if (lastLocation != null) {
-                      reply.put("latitude", lastLocation.getLatitude());
-                      reply.put("longitude", lastLocation.getLongitude());
-                      reply.put("altitude", lastLocation.getAltitude());
-                      result.success(reply);
-                    } else {
-                      result.error("", "", null); // ???
-                    }
-                  }
-
-                  @Override
-                  public void onFailure(@NonNull Exception exception) {
-                    result.error("", "", null); // ???
-                  }
-                });
-          }
-          break;
-        }
-      case "style#addImage":
-        {
-          if (style == null) {
-            result.error(
-                "STYLE IS NULL",
-                "The style is null. Has onStyleLoaded() already been invoked?",
-                null);
-          }
-          style.addImage(
-              call.argument("name"),
-              BitmapFactory.decodeByteArray(call.argument("bytes"), 0, call.argument("length")),
-              call.argument("sdf"));
-          result.success(null);
-          break;
-        }
-      case "style#addImageSource":
-        {
-          if (style == null) {
-            result.error(
-                "STYLE IS NULL",
-                "The style is null. Has onStyleLoaded() already been invoked?",
-                null);
-          }
-          List<LatLng> coordinates = Convert.toLatLngList(call.argument("coordinates"), false);
-          style.addSource(
-              new ImageSource(
-                  call.argument("imageSourceId"),
-                  new LatLngQuad(
-                      coordinates.get(0),
-                      coordinates.get(1),
-                      coordinates.get(2),
-                      coordinates.get(3)),
-                  BitmapFactory.decodeByteArray(
-                      call.argument("bytes"), 0, call.argument("length"))));
-          result.success(null);
-          break;
-        }
-        case "style#updateImageSource":
-        {
-          if (style == null) {
-            result.error(
-                "STYLE IS NULL",
-                "The style is null. Has onStyleLoaded() already been invoked?",
-                null);
-          }
-          ImageSource imageSource = style.getSourceAs(call.argument("imageSourceId"));
-          List<LatLng> coordinates = Convert.toLatLngList(call.argument("coordinates"), false);
-          if (coordinates != null) {
-            imageSource.setCoordinates(
-                new LatLngQuad(
-                    coordinates.get(0),
-                    coordinates.get(1),
-                    coordinates.get(2),
-                    coordinates.get(3)));
-          }
-          byte[] bytes = call.argument("bytes");
-          if (bytes != null) {
-            imageSource.setImage(BitmapFactory.decodeByteArray(bytes, 0, call.argument("length")));
-          }
-          result.success(null);
-          break;
-        }
-      case "style#addSource":
-        {
-          final String id = Convert.toString(call.argument("sourceId"));
-          final Map<String, Object> properties = (Map<String, Object>) call.argument("properties");
-          SourcePropertyConverter.addSource(id, properties, style);
-          result.success(null);
-          break;
-        }
-
-      case "style#removeSource":
-        {
-          if (style == null) {
-            result.error(
-                "STYLE IS NULL",
-                "The style is null. Has onStyleLoaded() already been invoked?",
-                null);
-          }
-          style.removeSource((String) call.argument("sourceId"));
-          result.success(null);
-          break;
-        }
-      case "style#addLayer":
-        {
-          if (style == null) {
-            result.error(
-                "STYLE IS NULL",
-                "The style is null. Has onStyleLoaded() already been invoked?",
-                null);
-          }
-          addRasterLayer(
-              call.argument("imageLayerId"),
-              call.argument("imageSourceId"),
-              call.argument("minzoom") != null
-                  ? ((Double) call.argument("minzoom")).floatValue()
-                  : null,
-              call.argument("maxzoom") != null
-                  ? ((Double) call.argument("maxzoom")).floatValue()
-                  : null,
-              null,
-              new PropertyValue[] {},
-              null);
-          result.success(null);
-          break;
-        }
-      case "style#addLayerBelow":
-        {
-          if (style == null) {
-            result.error(
-                "STYLE IS NULL",
-                "The style is null. Has onStyleLoaded() already been invoked?",
-                null);
-          }
-          addRasterLayer(
-              call.argument("imageLayerId"),
-              call.argument("imageSourceId"),
-              call.argument("minzoom") != null
-                  ? ((Double) call.argument("minzoom")).floatValue()
-                  : null,
-              call.argument("maxzoom") != null
-                  ? ((Double) call.argument("maxzoom")).floatValue()
-                  : null,
-              call.argument("belowLayerId"),
-              new PropertyValue[] {},
-              null);
-          result.success(null);
-          break;
-        }
-      case "style#removeLayer":
-        {
-          if (style == null) {
-            result.error(
-                "STYLE IS NULL",
-                "The style is null. Has onStyleLoaded() already been invoked?",
-                null);
-          }
-          String layerId = call.argument("layerId");
-          style.removeLayer(layerId);
-          interactiveFeatureLayerIds.remove(layerId);
-
-          result.success(null);
-          break;
-        }
-      case "map#setCameraBounds":
-        {
-          double west = call.argument("west");
-          double north = call.argument("north");
-          double south = call.argument("south");
-          double east = call.argument("east");
-
-          int padding = call.argument("padding");
-
-          LatLng locationOne = new LatLng(north, east);
-          LatLng locationTwo = new LatLng(south, west);
-          LatLngBounds latLngBounds = new LatLngBounds.Builder()
-                  .include(locationOne) // Northeast
-                  .include(locationTwo) // Southwest
-                  .build();
-          vietmapGL.easeCamera(CameraUpdateFactory.newLatLngBounds(latLngBounds,
-                  padding), 200);
-
-          break;
-        }
-      case "style#setFilter":
-        {
-          if (style == null) {
-            result.error(
-                "STYLE IS NULL",
-                "The style is null. Has onStyleLoaded() already been invoked?",
-                null);
-          }
-          String layerId = call.argument("layerId");
-          String filter = call.argument("filter");
-
-          Layer layer = style.getLayer(layerId);
-
-          JsonParser parser = new JsonParser();
-          JsonElement jsonElement = parser.parse(filter);
-          Expression expression = Expression.Converter.convert(jsonElement);
-
-          if (layer instanceof CircleLayer) {
-            ((CircleLayer) layer).setFilter(expression);
-          } else if (layer instanceof FillExtrusionLayer) {
-            ((FillExtrusionLayer) layer).setFilter(expression);
-          } else if (layer instanceof FillLayer) {
-            ((FillLayer) layer).setFilter(expression);
-          } else if (layer instanceof HeatmapLayer) {
-            ((HeatmapLayer) layer).setFilter(expression);
-          } else if (layer instanceof LineLayer) {
-            ((LineLayer) layer).setFilter(expression);
-          } else if (layer instanceof SymbolLayer) {
-            ((SymbolLayer) layer).setFilter(expression);
-          } else {
-            result.error(
-                "INVALID LAYER TYPE",
-                String.format("Layer '%s' does not support filtering.", layerId),
-                null);
-            break;
-          }
-
-          result.success(null);
-          break;
-        }
-        case "style#getFilter":
-        {
-          if (style == null) {
-            result.error(
-                    "STYLE IS NULL",
-                    "The style is null. Has onStyleLoaded() already been invoked?",
-                    null);
-          }
-          Map<String, Object> reply = new HashMap<>();
-          String layerId = call.argument("layerId");
-          Layer layer = style.getLayer(layerId);
-
-          Expression filter;
-          if (layer instanceof CircleLayer) {
-            filter = ((CircleLayer) layer).getFilter();
-          } else if (layer instanceof FillExtrusionLayer) {
-            filter = ((FillExtrusionLayer) layer).getFilter();
-          } else if (layer instanceof FillLayer) {
-            filter = ((FillLayer) layer).getFilter();
-          } else if (layer instanceof HeatmapLayer) {
-            filter = ((HeatmapLayer) layer).getFilter();
-          } else if (layer instanceof LineLayer) {
-            filter = ((LineLayer) layer).getFilter();
-          } else if (layer instanceof SymbolLayer) {
-            filter = ((SymbolLayer) layer).getFilter();
-          } else {
-            result.error(
-                    "INVALID LAYER TYPE",
-                    String.format("Layer '%s' does not support filtering.", layerId),
-                    null);
-            break;
-          }
-
-          reply.put("filter", filter.toString());
-          result.success(reply);
-          break;
-        }
-        case "layer#setVisibility":
-        {
-
-          if (style == null) {
-            result.error(
-                "STYLE IS NULL",
-                "The style is null. Has onStyleLoaded() already been invoked?",
-                null);
-          }
-          String layerId = call.argument("layerId");
-          boolean visible = call.argument("visible");
-
-          Layer layer = style.getLayer(layerId);
-
-          if (layer != null) {
-            layer.setProperties(PropertyFactory.visibility(visible ? Property.VISIBLE : Property.NONE));
-          }
-
-          result.success(null);
-          break;
-
-        }
-        case "map#querySourceFeatures":
-        {
-          Map<String, Object> reply = new HashMap<>();
-          List<Feature> features;
-
-          String sourceId = (String) call.argument("sourceId");
-
-          String sourceLayerId = (String) call.argument("sourceLayerId");
-
-          List<Object> filter = call.argument("filter");
-          JsonElement jsonElement = filter == null ? null : new Gson().toJsonTree(filter);
-          JsonArray jsonArray = null;
-          if (jsonElement != null && jsonElement.isJsonArray()) {
-            jsonArray = jsonElement.getAsJsonArray();
-          }
-          Expression filterExpression =
-                  jsonArray == null ? null : Expression.Converter.convert(jsonArray);
-
-
-          Source source = style.getSource(sourceId);
-          if (source instanceof GeoJsonSource) {
-            features = ((GeoJsonSource) source).querySourceFeatures(filterExpression);
-          } else if (source instanceof CustomGeometrySource) {
-            features = ((CustomGeometrySource) source).querySourceFeatures(filterExpression);
-          } else if (source instanceof VectorSource && sourceLayerId != null) {
-            features = ((VectorSource) source).querySourceFeatures(new String[] {sourceLayerId}, filterExpression);
-          } else {
-            features = Collections.emptyList();
-          }
-
-          List<String> featuresJson = new ArrayList<>();
-          for (Feature feature : features) {
-            featuresJson.add(feature.toJson());
-          }
-          reply.put("features", featuresJson);
-          result.success(reply);
-          break;
-        }
-        case "style#getLayerIds":
-        {
-          if (style == null) {
-            result.error(
-                    "STYLE IS NULL",
-                    "The style is null. Has onStyleLoaded() already been invoked?",
-                    null);
-          }
-          Map<String, Object> reply = new HashMap<>();
-
-          List<String> layerIds = new ArrayList<>();
-          for (Layer layer : style.getLayers()) {
-            layerIds.add(layer.getId());
-          }
-
-          reply.put("layers", layerIds);
-          result.success(reply);
-          break;
-        }
-      case "style#getSourceIds":
-      {
-        if (style == null) {
-          result.error(
-                  "STYLE IS NULL",
-                  "The style is null. Has onStyleLoaded() already been invoked?",
-                  null);
-        }
-        Map<String, Object> reply = new HashMap<>();
-
-        List<String> sourceIds = new ArrayList<>();
-        for (Source source : style.getSources()) {
-          sourceIds.add(source.getId());
-        }
-
-        reply.put("sources", sourceIds);
-        result.success(reply);
-        break;
-      }
-      default:
-        result.notImplemented();
     }
-  }
 
-  @Override
-  public void onCameraMoveStarted(int reason) {
-    final Map<String, Object> arguments = new HashMap<>(2);
-    boolean isGesture = reason == VietMapGL.OnCameraMoveStartedListener.REASON_API_GESTURE;
-    arguments.put("isGesture", isGesture);
-    methodChannel.invokeMethod("camera#onMoveStarted", arguments);
-  }
-
-  @Override
-  public void onCameraMove() {
-    if (!trackCameraPosition) {
-      return;
-    }
-    final Map<String, Object> arguments = new HashMap<>(2);
-    arguments.put("position", Convert.toJson(vietmapGL.getCameraPosition()));
-    methodChannel.invokeMethod("camera#onMove", arguments);
-  }
-
-  @Override
-  public void onCameraIdle() {
-    final Map<String, Object> arguments = new HashMap<>(2);
-    if (trackCameraPosition) {
-      arguments.put("position", Convert.toJson(vietmapGL.getCameraPosition()));
-    }
-    methodChannel.invokeMethod("camera#onIdle", arguments);
-  }
-
-  @Override
-  public void onCameraTrackingChanged(int currentMode) {
-    final Map<String, Object> arguments = new HashMap<>(2);
-    switch (currentMode) {
-        case CameraMode.NONE:
-            arguments.put("mode", 0);
-            break;
-        case CameraMode.TRACKING:
-            arguments.put("mode", 1);
-            break;
-        case CameraMode.TRACKING_COMPASS:
-            arguments.put("mode", 2);
-            break;
-        case CameraMode.TRACKING_GPS:
-            arguments.put("mode", 3);
-            break;
-        default:
-            Log.e(TAG, "Unable to map " + currentMode + " to a tracking mode");
+    /**
+     * Destroy the MapView and cleans up listeners.
+     * It's very important to call mapViewContainer.removeView(mapView) to make sure
+     * that {@link TextureView#()} is called which releases the
+     * underlying surface.
+     * This is required due to an FlutterEngine change that was introduce when updating from
+     * Flutter 2.10.5 to Flutter 3.10.0.
+     * This FlutterEngine change is not calling `removeView` on a PlatformView which causes the issue.
+     * <p>
+     * For more information check out:
+     * <a href="https://github.com/flutter/flutter/issues/107297">Flutter issue</a>
+     * <a href="https://github.com/flutter/engine/commit/8dc7cd1b1a33b5da561ac859cdcc49705ad1e598">Flutter Engine commit that introduced the issue</a>
+     * <a href="https://github.com/vietmap-company/vietmap_flutter_gl/issues/182">The reported issue in the VietmapGL repo</a>
+     */
+    private void destroyMapViewIfNecessary() {
+        if (mapView == null) {
             return;
+        }
+
+        if (locationComponent != null) {
+            locationComponent.setLocationComponentEnabled(false);
+        }
+        stopListeningForLocationUpdates();
+
+        mapViewContainer.removeView(mapView);
+
+        mapView.onStop();
+        mapView.onDestroy();
+
+        mapView = null;
     }
 
-    methodChannel.invokeMethod("map#onCameraTrackingChanged", arguments);
-  }
-
-  @Override
-  public void onCameraTrackingDismissed() {
-    this.myLocationTrackingMode = 0;
-    methodChannel.invokeMethod("map#onCameraTrackingDismissed", new HashMap<>());
-  }
-
-  @Override
-  public void onDidBecomeIdle() {
-    methodChannel.invokeMethod("map#onIdle", new HashMap<>());
-  }
-
-  @Override
-  public boolean onMapClick(@NonNull LatLng point) {
-    PointF pointf = vietmapGL.getProjection().toScreenLocation(point);
-    RectF rectF = new RectF(pointf.x - 10, pointf.y - 10, pointf.x + 10, pointf.y + 10);
-    Pair<Feature, String> featureLayerPair = firstFeatureOnLayers(rectF);
-    final Map<String, Object> arguments = new HashMap<>();
-    arguments.put("x", pointf.x);
-    arguments.put("y", pointf.y);
-    arguments.put("lng", point.getLongitude());
-    arguments.put("lat", point.getLatitude());
-    if (featureLayerPair != null && featureLayerPair.first != null) {
-      arguments.put("layerId", featureLayerPair.second);
-      arguments.put("id", featureLayerPair.first.id());
-      methodChannel.invokeMethod("feature#onTap", arguments);
-    } else {
-      methodChannel.invokeMethod("map#onMapClick", arguments);
-    }
-    return true;
-  }
-
-  @Override
-  public boolean onMapLongClick(@NonNull LatLng point) {
-    PointF pointf = vietmapGL.getProjection().toScreenLocation(point);
-    final Map<String, Object> arguments = new HashMap<>(5);
-    arguments.put("x", pointf.x);
-    arguments.put("y", pointf.y);
-    arguments.put("lng", point.getLongitude());
-    arguments.put("lat", point.getLatitude());
-    methodChannel.invokeMethod("map#onMapLongClick", arguments);
-    return true;
-  }
-
-  @Override
-  public void dispose() {
-    if (disposed) {
-      return;
-    }
-    disposed = true;
-    methodChannel.setMethodCallHandler(null);
-    destroyMapViewIfNecessary();
-    Lifecycle lifecycle = lifecycleProvider.getLifecycle();
-    if (lifecycle != null) {
-      lifecycle.removeObserver(this);
-    }
-  }
-
-  private void moveCamera(CameraUpdate cameraUpdate, MethodChannel.Result result) {
-    if (cameraUpdate != null) {
-      // camera transformation not handled yet
-      vietmapGL.moveCamera(
-          cameraUpdate,
-          new OnCameraMoveFinishedListener() {
-            @Override
-            public void onFinish() {
-              super.onFinish();
-              result.success(true);
-            }
-
-            @Override
-            public void onCancel() {
-              super.onCancel();
-              result.success(false);
-            }
-          });
-
-      // moveCamera(cameraUpdate);
-    } else {
-      result.success(false);
-    }
-  }
-
-  private void animateCamera(
-      CameraUpdate cameraUpdate, Integer duration, MethodChannel.Result result) {
-    final OnCameraMoveFinishedListener onCameraMoveFinishedListener =
-        new OnCameraMoveFinishedListener() {
-          @Override
-          public void onFinish() {
-            super.onFinish();
-            result.success(true);
-          }
-
-          @Override
-          public void onCancel() {
-            super.onCancel();
-            result.success(false);
-          }
-        };
-    if (cameraUpdate != null && duration != null) {
-      // camera transformation not handled yet
-      vietmapGL.animateCamera(cameraUpdate, duration, onCameraMoveFinishedListener);
-    } else if (cameraUpdate != null) {
-      // camera transformation not handled yet
-      vietmapGL.animateCamera(cameraUpdate, onCameraMoveFinishedListener);
-    } else {
-      result.success(false);
-    }
-  }
-
-  /**
-   * Destroy the MapView and cleans up listeners.
-   * It's very important to call mapViewContainer.removeView(mapView) to make sure
-   * that {@link TextureView#()} is called which releases the
-   * underlying surface.
-   * This is required due to an FlutterEngine change that was introduce when updating from
-   * Flutter 2.10.5 to Flutter 3.10.0.
-   * This FlutterEngine change is not calling `removeView` on a PlatformView which causes the issue.
-   * <p>
-   * For more information check out:
-   * <a href="https://github.com/flutter/flutter/issues/107297">Flutter issue</a>
-   * <a href="https://github.com/flutter/engine/commit/8dc7cd1b1a33b5da561ac859cdcc49705ad1e598">Flutter Engine commit that introduced the issue</a>
-   * <a href="https://github.com/vietmap-company/vietmap_flutter_gl/issues/182">The reported issue in the VietmapGL repo</a>
-   */
-  private void destroyMapViewIfNecessary() {
-    if (mapView == null) {
-      return;
+    @Override
+    public void onCreate(@NonNull LifecycleOwner owner) {
+        if (disposed) {
+            return;
+        }
+        mapView.onCreate(null);
     }
 
-    if (locationComponent != null) {
-      locationComponent.setLocationComponentEnabled(false);
+    @Override
+    public void onStart(@NonNull LifecycleOwner owner) {
+        if (disposed) {
+            return;
+        }
+        mapView.onStart();
     }
-    stopListeningForLocationUpdates();
 
-    mapViewContainer.removeView(mapView);
+    @Override
+    public void onResume(@NonNull LifecycleOwner owner) {
+        if (disposed) {
+            return;
+        }
+        mapView.onResume();
 
-    mapView.onStop();
-    mapView.onDestroy();
-
-    mapView = null;
-  }
-
-  @Override
-  public void onCreate(@NonNull LifecycleOwner owner) {
-    if (disposed) {
-      return;
+        recenter();
+        if (myLocationEnabled) {
+            startListeningForLocationUpdates();
+        }
     }
-    mapView.onCreate(null);
-  }
 
-  @Override
-  public void onStart(@NonNull LifecycleOwner owner) {
-    if (disposed) {
-      return;
+    @Override
+    public void onPause(@NonNull LifecycleOwner owner) {
+        if (disposed) {
+            return;
+        }
+        mapView.onPause();
     }
-    mapView.onStart();
-  }
 
-  @Override
-  public void onResume(@NonNull LifecycleOwner owner) {
-    if (disposed) {
-      return;
+    @Override
+    public void onStop(@NonNull LifecycleOwner owner) {
+        if (disposed) {
+            return;
+        }
+        mapView.onStop();
     }
-    mapView.onResume();
 
-    recenter();
-    if (myLocationEnabled) {
-      startListeningForLocationUpdates();
+    @Override
+    public void onDestroy(@NonNull LifecycleOwner owner) {
+        owner.getLifecycle().removeObserver(this);
+        if (disposed) {
+            return;
+        }
+        destroyMapViewIfNecessary();
     }
-  }
 
-  @Override
-  public void onPause(@NonNull LifecycleOwner owner) {
-    if (disposed) {
-      return;
+
+    @Override
+    public void setCameraTargetBounds(LatLngBounds bounds) {
+        this.bounds = bounds;
     }
-    mapView.onPause();
-  }
 
-  @Override
-  public void onStop(@NonNull LifecycleOwner owner) {
-    if (disposed) {
-      return;
-    }
-    mapView.onStop();
-  }
-
-  @Override
-  public void onDestroy(@NonNull LifecycleOwner owner) {
-    owner.getLifecycle().removeObserver(this);
-    if (disposed) {
-      return;
-    }
-    destroyMapViewIfNecessary();
-  }
-
-
-  @Override
-  public void setCameraTargetBounds(LatLngBounds bounds) {
-    this.bounds = bounds;
-  }
-
-  @Override
-  public void setLocationEngineProperties(LocationEngineRequest locationEngineRequest){
-    if(locationComponent != null){
+    @Override
+    public void setLocationEngineProperties(LocationEngineRequest locationEngineRequest) {
+        if (locationComponent != null) {
 //        if(locationEngineRequest.getPriority() == LocationEngineRequest.PRIORITY_HIGH_ACCURACY){
 //            locationComponent.setLocationEngine(new LocationEngineProxy(
 //                new VietmapGLGPSLocationEngine(context)));
@@ -1997,445 +2178,479 @@ final class VietmapGLController
 //               LocationEngineDefault.INSTANCE.getDefaultLocationEngine(context));
 //            }
 
-      locationComponent.setLocationEngine(
-              LocationEngineDefault.INSTANCE.getDefaultLocationEngine(context));
+            locationComponent.setLocationEngine(
+                    LocationEngineDefault.INSTANCE.getDefaultLocationEngine(context));
 
 //      locationComponent.setLocationEngineRequest(locationEngineRequest);
-    }
-  }
-
-  @Override
-  public void setCompassEnabled(boolean compassEnabled) {
-    vietmapGL.getUiSettings().setCompassEnabled(compassEnabled);
-  }
-
-  @Override
-  public void setTrackCameraPosition(boolean trackCameraPosition) {
-    this.trackCameraPosition = trackCameraPosition;
-  }
-
-  @Override
-  public void setRotateGesturesEnabled(boolean rotateGesturesEnabled) {
-    vietmapGL.getUiSettings().setRotateGesturesEnabled(rotateGesturesEnabled);
-  }
-
-  @Override
-  public void setScrollGesturesEnabled(boolean scrollGesturesEnabled) {
-    vietmapGL.getUiSettings().setScrollGesturesEnabled(scrollGesturesEnabled);
-  }
-
-  @Override
-  public void setTiltGesturesEnabled(boolean tiltGesturesEnabled) {
-    vietmapGL.getUiSettings().setTiltGesturesEnabled(tiltGesturesEnabled);
-  }
-
-  @Override
-  public void setMinMaxZoomPreference(Float min, Float max) {
-    vietmapGL.setMinZoomPreference(min != null ? min : VietMapConstants.MINIMUM_ZOOM);
-    vietmapGL.setMaxZoomPreference(max != null ? max : VietMapConstants.MAXIMUM_ZOOM);
-  }
-
-  @Override
-  public void setZoomGesturesEnabled(boolean zoomGesturesEnabled) {
-    vietmapGL.getUiSettings().setZoomGesturesEnabled(zoomGesturesEnabled);
-  }
-
-  @Override
-  public void setMyLocationEnabled(boolean myLocationEnabled) {
-    if (this.myLocationEnabled == myLocationEnabled) {
-      return;
-    }
-    this.myLocationEnabled = myLocationEnabled;
-    if (vietmapGL != null) {
-      updateMyLocationEnabled();
-    }
-  }
-
-  @Override
-  public void setMyLocationTrackingMode(int myLocationTrackingMode) {
-    if (vietmapGL != null) {
-      // ensure that location is trackable
-      updateMyLocationEnabled();
-    }
-    if (this.myLocationTrackingMode == myLocationTrackingMode) {
-      return;
-    }
-    this.myLocationTrackingMode = myLocationTrackingMode;
-    if (vietmapGL != null && locationComponent != null) {
-      updateMyLocationTrackingMode();
-    }
-  }
-
-  @Override
-  public void setMyLocationRenderMode(int myLocationRenderMode) {
-    if (this.myLocationRenderMode == myLocationRenderMode) {
-      return;
-    }
-    this.myLocationRenderMode = myLocationRenderMode;
-    if (vietmapGL != null && locationComponent != null) {
-      updateMyLocationRenderMode();
-    }
-  }
-
-  public void setLogoViewMargins(int x, int y) {
-    vietmapGL.getUiSettings().setLogoMargins(x, 0, 0, y);
-  }
-
-  @Override
-  public void setCompassGravity(int gravity) {
-    switch (gravity) {
-      case 0:
-        vietmapGL.getUiSettings().setCompassGravity(Gravity.TOP | Gravity.START);
-        break;
-      default:
-      case 1:
-        vietmapGL.getUiSettings().setCompassGravity(Gravity.TOP | Gravity.END);
-        break;
-      case 2:
-        vietmapGL.getUiSettings().setCompassGravity(Gravity.BOTTOM | Gravity.START);
-        break;
-      case 3:
-        vietmapGL.getUiSettings().setCompassGravity(Gravity.BOTTOM | Gravity.END);
-        break;
-    }
-  }
-
-  @Override
-  public void setCompassViewMargins(int x, int y) {
-    switch (vietmapGL.getUiSettings().getCompassGravity()) {
-      case Gravity.TOP | Gravity.START:
-        vietmapGL.getUiSettings().setCompassMargins(x, y, 0, 0);
-        break;
-      default:
-      case Gravity.TOP | Gravity.END:
-        vietmapGL.getUiSettings().setCompassMargins(0, y, x, 0);
-        break;
-      case Gravity.BOTTOM | Gravity.START:
-        vietmapGL.getUiSettings().setCompassMargins(x, 0, 0, y);
-        break;
-      case Gravity.BOTTOM | Gravity.END:
-        vietmapGL.getUiSettings().setCompassMargins(0, 0, x, y);
-        break;
-    }
-  }
-
-  @Override
-  public void setAttributionButtonGravity(int gravity) {
-    switch (gravity) {
-      case 0:
-        vietmapGL.getUiSettings().setAttributionGravity(Gravity.TOP | Gravity.START);
-        break;
-      default:
-      case 1:
-        vietmapGL.getUiSettings().setAttributionGravity(Gravity.TOP | Gravity.END);
-        break;
-      case 2:
-        vietmapGL.getUiSettings().setAttributionGravity(Gravity.BOTTOM | Gravity.START);
-        break;
-      case 3:
-        vietmapGL.getUiSettings().setAttributionGravity(Gravity.BOTTOM | Gravity.END);
-        break;
-    }
-  }
-
-  @Override
-  public void setAttributionButtonMargins(int x, int y) {
-    switch (vietmapGL.getUiSettings().getAttributionGravity()) {
-      case Gravity.TOP | Gravity.START:
-        vietmapGL.getUiSettings().setAttributionMargins(x, y, 0, 0);
-        break;
-      default:
-      case Gravity.TOP | Gravity.END:
-        vietmapGL.getUiSettings().setAttributionMargins(0, y, x, 0);
-        break;
-      case Gravity.BOTTOM | Gravity.START:
-        vietmapGL.getUiSettings().setAttributionMargins(x, 0, 0, y);
-        break;
-      case Gravity.BOTTOM | Gravity.END:
-        vietmapGL.getUiSettings().setAttributionMargins(0, 0, x, y);
-        break;
-    }
-  }
-  private void updateLogoEnabled(){
-    if(vietmapGL == null){
-      return;
-    }
-    vietmapGL.getUiSettings().setLogoEnabled(this.logoEnabled);
-
-  }
-  private void updateMyLocationEnabled() {
-    if (this.locationComponent == null && myLocationEnabled && vietmapGL.getStyle() != null) {
-      enableLocationComponent(vietmapGL.getStyle());
+        }
     }
 
-    if (myLocationEnabled) {
-      startListeningForLocationUpdates();
-    } else {
-      stopListeningForLocationUpdates();
+    @Override
+    public void setCompassEnabled(boolean compassEnabled) {
+        vietmapGL.getUiSettings().setCompassEnabled(compassEnabled);
     }
 
-    if (locationComponent != null) {
-      locationComponent.setLocationComponentEnabled(myLocationEnabled);
+    @Override
+    public void setTrackCameraPosition(boolean trackCameraPosition) {
+        this.trackCameraPosition = trackCameraPosition;
     }
-  }
 
-  private void startListeningForLocationUpdates() {
-    if (locationEngineCallback == null
-        && locationComponent != null
-        && locationComponent.isLocationComponentActivated()
-        && locationComponent.getLocationEngine() != null) {
-      locationEngineCallback =
-          new LocationEngineCallback<LocationEngineResult>() {
-            @Override
-            public void onSuccess(LocationEngineResult result) {
-              onUserLocationUpdate(result.getLastLocation());
+    @Override
+    public void setRotateGesturesEnabled(boolean rotateGesturesEnabled) {
+        vietmapGL.getUiSettings().setRotateGesturesEnabled(rotateGesturesEnabled);
+    }
+
+    @Override
+    public void setScrollGesturesEnabled(boolean scrollGesturesEnabled) {
+        vietmapGL.getUiSettings().setScrollGesturesEnabled(scrollGesturesEnabled);
+    }
+
+    @Override
+    public void setTiltGesturesEnabled(boolean tiltGesturesEnabled) {
+        vietmapGL.getUiSettings().setTiltGesturesEnabled(tiltGesturesEnabled);
+    }
+
+    @Override
+    public void setMinMaxZoomPreference(Float min, Float max) {
+        vietmapGL.setMinZoomPreference(min != null ? min : VietMapConstants.MINIMUM_ZOOM);
+        vietmapGL.setMaxZoomPreference(max != null ? max : VietMapConstants.MAXIMUM_ZOOM);
+    }
+
+    @Override
+    public void setZoomGesturesEnabled(boolean zoomGesturesEnabled) {
+        vietmapGL.getUiSettings().setZoomGesturesEnabled(zoomGesturesEnabled);
+    }
+
+    @Override
+    public void setDoubleClickZoomEnabled(boolean doubleClickZoomEnabled) {
+        vietmapGL.getUiSettings().setDoubleTapGesturesEnabled(doubleClickZoomEnabled);
+    }
+
+    @Override
+    public void setForegroundLoadColor(int loadColor) {
+        // Only meaningful while the map view is being created, so this runtime
+        // path is intentionally a no-op. See VietmapGLBuilder.
+    }
+
+    @Override
+    public void setTranslucentTextureSurface(boolean translucentTextureSurface) {
+        // Only meaningful while the map view is being created, so this runtime
+        // path is intentionally a no-op. See VietmapGLBuilder.
+    }
+
+    @Override
+    public void setMyLocationEnabled(boolean myLocationEnabled) {
+        if (this.myLocationEnabled == myLocationEnabled) {
+            return;
+        }
+        this.myLocationEnabled = myLocationEnabled;
+        if (vietmapGL != null) {
+            updateMyLocationEnabled();
+        }
+    }
+
+    @Override
+    public void setMyLocationTrackingMode(int myLocationTrackingMode) {
+        if (vietmapGL != null) {
+            // ensure that location is trackable
+            updateMyLocationEnabled();
+        }
+        if (this.myLocationTrackingMode == myLocationTrackingMode) {
+            return;
+        }
+        this.myLocationTrackingMode = myLocationTrackingMode;
+        // style == null means a new style is still loading; the location component is
+        // then bound to sources that are already gone. onStyleLoaded re-applies the
+        // tracking mode through updateMyLocationEnabled/enableLocationComponent.
+        if (vietmapGL != null && locationComponent != null && style != null) {
+            updateMyLocationTrackingMode();
+        }
+    }
+
+    @Override
+    public void setMyLocationRenderMode(int myLocationRenderMode) {
+        if (this.myLocationRenderMode == myLocationRenderMode) {
+            return;
+        }
+        this.myLocationRenderMode = myLocationRenderMode;
+        if (vietmapGL != null && locationComponent != null && style != null) {
+            updateMyLocationRenderMode();
+        }
+    }
+
+    public void setLogoViewMargins(int x, int y) {
+        vietmapGL.getUiSettings().setLogoMargins(x, 0, 0, y);
+    }
+
+    @Override
+    public void setCompassGravity(int gravity) {
+        switch (gravity) {
+            case 0:
+                vietmapGL.getUiSettings().setCompassGravity(Gravity.TOP | Gravity.START);
+                break;
+            default:
+            case 1:
+                vietmapGL.getUiSettings().setCompassGravity(Gravity.TOP | Gravity.END);
+                break;
+            case 2:
+                vietmapGL.getUiSettings().setCompassGravity(Gravity.BOTTOM | Gravity.START);
+                break;
+            case 3:
+                vietmapGL.getUiSettings().setCompassGravity(Gravity.BOTTOM | Gravity.END);
+                break;
+        }
+    }
+
+    @Override
+    public void setCompassViewMargins(int x, int y) {
+        switch (vietmapGL.getUiSettings().getCompassGravity()) {
+            case Gravity.TOP | Gravity.START:
+                vietmapGL.getUiSettings().setCompassMargins(x, y, 0, 0);
+                break;
+            default:
+            case Gravity.TOP | Gravity.END:
+                vietmapGL.getUiSettings().setCompassMargins(0, y, x, 0);
+                break;
+            case Gravity.BOTTOM | Gravity.START:
+                vietmapGL.getUiSettings().setCompassMargins(x, 0, 0, y);
+                break;
+            case Gravity.BOTTOM | Gravity.END:
+                vietmapGL.getUiSettings().setCompassMargins(0, 0, x, y);
+                break;
+        }
+    }
+
+    @Override
+    public void setAttributionButtonGravity(int gravity) {
+        switch (gravity) {
+            case 0:
+                vietmapGL.getUiSettings().setAttributionGravity(Gravity.TOP | Gravity.START);
+                break;
+            default:
+            case 1:
+                vietmapGL.getUiSettings().setAttributionGravity(Gravity.TOP | Gravity.END);
+                break;
+            case 2:
+                vietmapGL.getUiSettings().setAttributionGravity(Gravity.BOTTOM | Gravity.START);
+                break;
+            case 3:
+                vietmapGL.getUiSettings().setAttributionGravity(Gravity.BOTTOM | Gravity.END);
+                break;
+        }
+    }
+
+    @Override
+    public void setAttributionButtonMargins(int x, int y) {
+        switch (vietmapGL.getUiSettings().getAttributionGravity()) {
+            case Gravity.TOP | Gravity.START:
+                vietmapGL.getUiSettings().setAttributionMargins(x, y, 0, 0);
+                break;
+            default:
+            case Gravity.TOP | Gravity.END:
+                vietmapGL.getUiSettings().setAttributionMargins(0, y, x, 0);
+                break;
+            case Gravity.BOTTOM | Gravity.START:
+                vietmapGL.getUiSettings().setAttributionMargins(x, 0, 0, y);
+                break;
+            case Gravity.BOTTOM | Gravity.END:
+                vietmapGL.getUiSettings().setAttributionMargins(0, 0, x, y);
+                break;
+        }
+    }
+
+    private void updateLogoEnabled() {
+        if (vietmapGL == null) {
+            return;
+        }
+        vietmapGL.getUiSettings().setLogoEnabled(this.logoEnabled);
+
+    }
+
+    private void updateMyLocationEnabled() {
+        // `this.style` rather than vietmapGL.getStyle(): the latter still hands back
+        // the outgoing Style while a new one is loading, and activating the location
+        // component against it throws from inside the SDK.
+        if (this.locationComponent == null && myLocationEnabled && this.style != null) {
+            enableLocationComponent(this.style);
+        }
+
+        if (myLocationEnabled) {
+            startListeningForLocationUpdates();
+        } else {
+            stopListeningForLocationUpdates();
+        }
+
+        if (locationComponent != null) {
+            locationComponent.setLocationComponentEnabled(myLocationEnabled);
+        }
+    }
+
+    private void startListeningForLocationUpdates() {
+        if (locationEngineCallback == null
+                && locationComponent != null
+                && locationComponent.isLocationComponentActivated()
+                && locationComponent.getLocationEngine() != null) {
+            locationEngineCallback =
+                    new LocationEngineCallback<LocationEngineResult>() {
+                        @Override
+                        public void onSuccess(LocationEngineResult result) {
+                            onUserLocationUpdate(result.getLastLocation());
+                        }
+
+                        @Override
+                        public void onFailure(@NonNull Exception exception) {
+                        }
+                    };
+            locationComponent
+                    .getLocationEngine()
+                    .requestLocationUpdates(
+                            locationComponent.getLocationEngineRequest(), locationEngineCallback, null);
+        }
+    }
+
+    private void stopListeningForLocationUpdates() {
+        if (locationEngineCallback != null
+                && locationComponent != null
+                && locationComponent.isLocationComponentActivated()
+                && locationComponent.getLocationEngine() != null) {
+            locationComponent.getLocationEngine().removeLocationUpdates(locationEngineCallback);
+            locationEngineCallback = null;
+        }
+    }
+
+    private void updateMyLocationTrackingMode() {
+        int[] mapboxTrackingModes =
+                new int[]{
+                        CameraMode.NONE, CameraMode.TRACKING, CameraMode.TRACKING_COMPASS, CameraMode.TRACKING_GPS
+                };
+        // Re-activate before touching the camera mode, not after. setCameraMode
+        // makes the component refresh its layer sources, and if it is still bound
+        // to a style that has been replaced the SDK throws
+        // "Calling getSourceAs when a newer style is loading/has loaded".
+        customLocationComponentOptions(style);
+        locationComponent.setCameraMode(mapboxTrackingModes[this.myLocationTrackingMode]);
+    }
+
+    private void updateMyLocationRenderMode() {
+        int[] mapboxRenderModes = new int[]{RenderMode.NORMAL, RenderMode.COMPASS, RenderMode.GPS};
+        customLocationComponentOptions(style);
+        locationComponent.setRenderMode(mapboxRenderModes[this.myLocationRenderMode]);
+    }
+
+    private boolean hasLocationPermission() {
+        return checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED
+                || checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
+                == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private int checkSelfPermission(String permission) {
+        if (permission == null) {
+            throw new IllegalArgumentException("permission is null");
+        }
+        return context.checkPermission(
+                permission, android.os.Process.myPid(), android.os.Process.myUid());
+    }
+
+    /**
+     * Tries to find highest scale image for display type
+     *
+     * @param imageId
+     * @param density
+     * @return
+     */
+    private Bitmap getScaledImage(String imageId, float density) {
+        AssetFileDescriptor assetFileDescriptor;
+
+        // Split image path into parts.
+        List<String> imagePathList = Arrays.asList(imageId.split("/"));
+        List<String> assetPathList = new ArrayList<>();
+
+        // "On devices with a device pixel ratio of 1.8, the asset .../2.0x/my_icon.png would be chosen.
+        // For a device pixel ratio of 2.7, the asset .../3.0x/my_icon.png would be chosen."
+        // Source: https://flutter.dev/docs/development/ui/assets-and-images#resolution-aware
+        for (int i = (int) Math.ceil(density); i > 0; i--) {
+            String assetPath;
+            if (i == 1) {
+                // If density is 1.0x then simply take the default asset path
+                assetPath = VietmapGLPlugin.flutterAssets.getAssetFilePathByName(imageId);
+            } else {
+                // Build a resolution aware asset path as follows:
+                // <directory asset>/<ratio>/<image name>
+                // where ratio is 1.0x, 2.0x or 3.0x.
+                StringBuilder stringBuilder = new StringBuilder();
+                for (int j = 0; j < imagePathList.size() - 1; j++) {
+                    stringBuilder.append(imagePathList.get(j));
+                    stringBuilder.append("/");
+                }
+                stringBuilder.append(((float) i) + "x");
+                stringBuilder.append("/");
+                stringBuilder.append(imagePathList.get(imagePathList.size() - 1));
+                assetPath = VietmapGLPlugin.flutterAssets.getAssetFilePathByName(stringBuilder.toString());
             }
-
-            @Override
-            public void onFailure(@NonNull Exception exception) {}
-          };
-      locationComponent
-          .getLocationEngine()
-          .requestLocationUpdates(
-              locationComponent.getLocationEngineRequest(), locationEngineCallback, null);
-    }
-  }
-
-  private void stopListeningForLocationUpdates() {
-    if (locationEngineCallback != null
-        && locationComponent != null
-            && locationComponent.isLocationComponentActivated()
-        && locationComponent.getLocationEngine() != null) {
-      locationComponent.getLocationEngine().removeLocationUpdates(locationEngineCallback);
-      locationEngineCallback = null;
-    }
-  }
-
-  private void updateMyLocationTrackingMode() {
-    int[] mapboxTrackingModes =
-        new int[] {
-          CameraMode.NONE, CameraMode.TRACKING, CameraMode.TRACKING_COMPASS, CameraMode.TRACKING_GPS
-        };
-    locationComponent.setCameraMode(mapboxTrackingModes[this.myLocationTrackingMode]);
-    customLocationComponentOptions(style);
-  }
-
-  private void updateMyLocationRenderMode() {
-    int[] mapboxRenderModes = new int[] {RenderMode.NORMAL, RenderMode.COMPASS, RenderMode.GPS};
-    locationComponent.setRenderMode(mapboxRenderModes[this.myLocationRenderMode]);
-    customLocationComponentOptions(style);
-  }
-
-  private boolean hasLocationPermission() {
-    return checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION)
-            == PackageManager.PERMISSION_GRANTED
-        || checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION)
-            == PackageManager.PERMISSION_GRANTED;
-  }
-
-  private int checkSelfPermission(String permission) {
-    if (permission == null) {
-      throw new IllegalArgumentException("permission is null");
-    }
-    return context.checkPermission(
-        permission, android.os.Process.myPid(), android.os.Process.myUid());
-  }
-
-  /**
-   * Tries to find highest scale image for display type
-   *
-   * @param imageId
-   * @param density
-   * @return
-   */
-  private Bitmap getScaledImage(String imageId, float density) {
-    AssetFileDescriptor assetFileDescriptor;
-
-    // Split image path into parts.
-    List<String> imagePathList = Arrays.asList(imageId.split("/"));
-    List<String> assetPathList = new ArrayList<>();
-
-    // "On devices with a device pixel ratio of 1.8, the asset .../2.0x/my_icon.png would be chosen.
-    // For a device pixel ratio of 2.7, the asset .../3.0x/my_icon.png would be chosen."
-    // Source: https://flutter.dev/docs/development/ui/assets-and-images#resolution-aware
-    for (int i = (int) Math.ceil(density); i > 0; i--) {
-      String assetPath;
-      if (i == 1) {
-        // If density is 1.0x then simply take the default asset path
-        assetPath = VietmapGLPlugin.flutterAssets.getAssetFilePathByName(imageId);
-      } else {
-        // Build a resolution aware asset path as follows:
-        // <directory asset>/<ratio>/<image name>
-        // where ratio is 1.0x, 2.0x or 3.0x.
-        StringBuilder stringBuilder = new StringBuilder();
-        for (int j = 0; j < imagePathList.size() - 1; j++) {
-          stringBuilder.append(imagePathList.get(j));
-          stringBuilder.append("/");
+            // Build up a list of resolution aware asset paths.
+            assetPathList.add(assetPath);
         }
-        stringBuilder.append(((float) i) + "x");
-        stringBuilder.append("/");
-        stringBuilder.append(imagePathList.get(imagePathList.size() - 1));
-        assetPath = VietmapGLPlugin.flutterAssets.getAssetFilePathByName(stringBuilder.toString());
-      }
-      // Build up a list of resolution aware asset paths.
-      assetPathList.add(assetPath);
+
+        // Iterate over asset paths and get the highest scaled asset (as a bitmap).
+        Bitmap bitmap = null;
+        for (String assetPath : assetPathList) {
+            try {
+                // Read path (throws exception if doesn't exist).
+                assetFileDescriptor = mapView.getContext().getAssets().openFd(assetPath);
+                InputStream assetStream = assetFileDescriptor.createInputStream();
+                bitmap = BitmapFactory.decodeStream(assetStream);
+                assetFileDescriptor.close(); // Close for memory
+                break; // If exists, break
+            } catch (IOException e) {
+                // Skip
+            }
+        }
+        return bitmap;
     }
 
-    // Iterate over asset paths and get the highest scaled asset (as a bitmap).
-    Bitmap bitmap = null;
-    for (String assetPath : assetPathList) {
-      try {
-        // Read path (throws exception if doesn't exist).
-        assetFileDescriptor = mapView.getContext().getAssets().openFd(assetPath);
-        InputStream assetStream = assetFileDescriptor.createInputStream();
-        bitmap = BitmapFactory.decodeStream(assetStream);
-        assetFileDescriptor.close(); // Close for memory
-        break; // If exists, break
-      } catch (IOException e) {
-        // Skip
-      }
+    boolean onMoveBegin(MoveGestureDetector detector) {
+        // onMoveBegin gets called even during a move - move end is also not called unless this function
+        // returns
+        // true at least once. To avoid redundant queries only check for feature if the previous event
+        // was ACTION_DOWN
+        if (detector.getPreviousEvent().getActionMasked() == MotionEvent.ACTION_DOWN
+                && detector.getPointersCount() == 1) {
+            PointF pointf = detector.getFocalPoint();
+            LatLng origin = vietmapGL.getProjection().fromScreenLocation(pointf);
+            RectF rectF = new RectF(pointf.x - 10, pointf.y - 10, pointf.x + 10, pointf.y + 10);
+            Pair<Feature, String> featureLayerPair = firstFeatureOnLayers(rectF);
+            if (featureLayerPair != null && featureLayerPair.first != null && startDragging(featureLayerPair.first, origin)) {
+                invokeFeatureDrag(pointf, "start");
+                return true;
+            }
+        }
+        return false;
     }
-    return bitmap;
-  }
 
-  boolean onMoveBegin(MoveGestureDetector detector) {
-    // onMoveBegin gets called even during a move - move end is also not called unless this function
-    // returns
-    // true at least once. To avoid redundant queries only check for feature if the previous event
-    // was ACTION_DOWN
-    if (detector.getPreviousEvent().getActionMasked() == MotionEvent.ACTION_DOWN
-        && detector.getPointersCount() == 1) {
-      PointF pointf = detector.getFocalPoint();
-      LatLng origin = vietmapGL.getProjection().fromScreenLocation(pointf);
-      RectF rectF = new RectF(pointf.x - 10, pointf.y - 10, pointf.x + 10, pointf.y + 10);
-      Pair<Feature, String> featureLayerPair = firstFeatureOnLayers(rectF);
-      if (featureLayerPair != null && featureLayerPair.first != null && startDragging(featureLayerPair.first, origin)) {
-        invokeFeatureDrag(pointf, "start");
+    private void invokeFeatureDrag(PointF pointf, String eventType) {
+        LatLng current = vietmapGL.getProjection().fromScreenLocation(pointf);
+
+        final Map<String, Object> arguments = new HashMap<>(9);
+        arguments.put("id", draggedFeature.id());
+        arguments.put("x", pointf.x);
+        arguments.put("y", pointf.y);
+        arguments.put("originLng", dragOrigin.getLongitude());
+        arguments.put("originLat", dragOrigin.getLatitude());
+        arguments.put("currentLng", current.getLongitude());
+        arguments.put("currentLat", current.getLatitude());
+        arguments.put("eventType", eventType);
+        arguments.put("deltaLng", current.getLongitude() - dragPrevious.getLongitude());
+        arguments.put("deltaLat", current.getLatitude() - dragPrevious.getLatitude());
+        dragPrevious = current;
+        methodChannel.invokeMethod("feature#onDrag", arguments);
+    }
+
+    boolean onMove(MoveGestureDetector detector) {
+        if (draggedFeature != null) {
+            if (detector.getPointersCount() > 1) {
+                stopDragging();
+                return true;
+            }
+            PointF pointf = detector.getFocalPoint();
+            invokeFeatureDrag(pointf, "drag");
+            return false;
+        }
         return true;
-      }
     }
-    return false;
-  }
 
-  private void invokeFeatureDrag(PointF pointf, String eventType) {
-    LatLng current = vietmapGL.getProjection().fromScreenLocation(pointf);
-
-    final Map<String, Object> arguments = new HashMap<>(9);
-    arguments.put("id", draggedFeature.id());
-    arguments.put("x", pointf.x);
-    arguments.put("y", pointf.y);
-    arguments.put("originLng", dragOrigin.getLongitude());
-    arguments.put("originLat", dragOrigin.getLatitude());
-    arguments.put("currentLng", current.getLongitude());
-    arguments.put("currentLat", current.getLatitude());
-    arguments.put("eventType", eventType);
-    arguments.put("deltaLng", current.getLongitude() - dragPrevious.getLongitude());
-    arguments.put("deltaLat", current.getLatitude() - dragPrevious.getLatitude());
-    dragPrevious = current;
-    methodChannel.invokeMethod("feature#onDrag", arguments);
-  }
-
-  boolean onMove(MoveGestureDetector detector) {
-    if (draggedFeature != null) {
-      if (detector.getPointersCount() > 1) {
+    void onMoveEnd(MoveGestureDetector detector) {
+        PointF pointf = detector.getFocalPoint();
+        invokeFeatureDrag(pointf, "end");
         stopDragging();
-        return true;
-      }
-      PointF pointf = detector.getFocalPoint();
-      invokeFeatureDrag(pointf, "drag");
-      return false;
     }
-    return true;
-  }
 
-  void onMoveEnd(MoveGestureDetector detector) {
-    PointF pointf = detector.getFocalPoint();
-    invokeFeatureDrag(pointf, "end");
-    stopDragging();
-  }
-
-  boolean startDragging(@NonNull Feature feature, @NonNull LatLng origin) {
-    final boolean draggable =
-        feature.hasNonNullValueForProperty("draggable")
-            ? feature.getBooleanProperty("draggable")
-            : false;
-    if (draggable) {
-      draggedFeature = feature;
-      dragPrevious = origin;
-      dragOrigin = origin;
-      return true;
+    boolean startDragging(@NonNull Feature feature, @NonNull LatLng origin) {
+        final boolean draggable =
+                feature.hasNonNullValueForProperty("draggable")
+                        ? feature.getBooleanProperty("draggable")
+                        : false;
+        if (draggable) {
+            draggedFeature = feature;
+            dragPrevious = origin;
+            dragOrigin = origin;
+            return true;
+        }
+        return false;
     }
-    return false;
-  }
 
-  void stopDragging() {
-    draggedFeature = null;
-    dragOrigin = null;
-    dragPrevious = null;
-  }
+    void stopDragging() {
+        draggedFeature = null;
+        dragOrigin = null;
+        dragPrevious = null;
+    }
 
-  void updateLayerProperties(MethodCall call){
-    String layerId = call.argument("layerId");
-    Object markers = call.argument("markers");
-      if (markers != null) {
-        boolean isLayerExist = false;
-        List<MarkerData> markerDataList = Convert.interpretMarkers((ArrayList) markers);
+    void updateLayerProperties(MethodCall call) {
+        String layerId = call.argument("layerId");
+        Object markers = call.argument("markers");
+        if (markers != null) {
+            boolean isLayerExist = false;
+            List<MarkerData> markerDataList = Convert.interpretMarkers((ArrayList) markers);
+            for (int i = 0; i < markerLayerData.size(); i++) {
+                MarkerLayerData markerLayerData = this.markerLayerData.get(i);
+                if (markerLayerData.getLayerId().equals(layerId)) {
+                    markerLayerData.setMarkerData(markerDataList);
+                    isLayerExist = true;
+                    break;
+                }
+            }
+            if (!isLayerExist) {
+                MarkerLayerData markerLayerData = new MarkerLayerData(markerDataList, layerId);
+                this.markerLayerData.add(markerLayerData);
+            }
+        }
+    }
+
+    @Override
+    public void onCameraDidChange(boolean b) {
         for (int i = 0; i < markerLayerData.size(); i++) {
-          MarkerLayerData markerLayerData = this.markerLayerData.get(i);
-          if (markerLayerData.getLayerId().equals(layerId)) {
-            markerLayerData.setMarkerData(markerDataList);
-            isLayerExist = true;
-            break;
-          }
+            MarkerLayerData markerLayerData = this.markerLayerData.get(i);
+            for (int j = 0; j < markerLayerData.getMarkerData().size(); j++) {
+                MarkerData markerData = markerLayerData.getMarkerData().get(j);
+                PointF point = vietmapGL
+                        .getProjection()
+                        .toScreenLocation(new LatLng(markerData.getLatitude(), markerData.getLongitude()));
+                markerData.setX((double) point.x);
+                markerData.setY((double) point.y);
+            }
         }
-        if (!isLayerExist) {
-          MarkerLayerData markerLayerData = new MarkerLayerData(markerDataList, layerId);
-          this.markerLayerData.add(markerLayerData);
+        methodChannel.invokeMethod("camera#onAnnotationUpdate", Convert.toJson(markerLayerData));
+    }
+
+
+    /**
+     * Simple Listener to listen for the status of camera movements.
+     */
+    public class OnCameraMoveFinishedListener implements VietMapGL.CancelableCallback {
+        @Override
+        public void onFinish() {
         }
-      }
-  }
 
-  @Override
-  public void onCameraDidChange(boolean b) {
-    for (int i = 0; i < markerLayerData.size(); i++) {
-        MarkerLayerData markerLayerData = this.markerLayerData.get(i);
-      for (int j = 0; j < markerLayerData.getMarkerData().size(); j++) {
-        MarkerData markerData = markerLayerData.getMarkerData().get(j);
-        PointF point = vietmapGL
-                .getProjection()
-                .toScreenLocation(new LatLng(markerData.getLatitude(), markerData.getLongitude()));
-        markerData.setX((double) point.x);
-        markerData.setY((double) point.y);
-      }
-    }
-    methodChannel.invokeMethod("camera#onAnnotationUpdate", Convert.toJson(markerLayerData));
-  }
-
-
-  /** Simple Listener to listen for the status of camera movements. */
-  public class OnCameraMoveFinishedListener implements VietMapGL.CancelableCallback {
-    @Override
-    public void onFinish() {}
-
-    @Override
-    public void onCancel() {}
-  }
-
-  private class MoveGestureListener implements MoveGestureDetector.OnMoveGestureListener {
-
-    @Override
-    public boolean onMoveBegin(MoveGestureDetector detector) {
-      return VietmapGLController.this.onMoveBegin(detector);
+        @Override
+        public void onCancel() {
+        }
     }
 
-    @Override
-    public boolean onMove(MoveGestureDetector detector, float distanceX, float distanceY) {
-      return VietmapGLController.this.onMove(detector);
-    }
+    private class MoveGestureListener implements MoveGestureDetector.OnMoveGestureListener {
 
-    @Override
-    public void onMoveEnd(MoveGestureDetector detector, float velocityX, float velocityY) {
-      VietmapGLController.this.onMoveEnd(detector);
+        @Override
+        public boolean onMoveBegin(MoveGestureDetector detector) {
+            return VietmapGLController.this.onMoveBegin(detector);
+        }
+
+        @Override
+        public boolean onMove(MoveGestureDetector detector, float distanceX, float distanceY) {
+            return VietmapGLController.this.onMove(detector);
+        }
+
+        @Override
+        public void onMoveEnd(MoveGestureDetector detector, float velocityX, float velocityY) {
+            VietmapGLController.this.onMoveEnd(detector);
+        }
     }
-  }
 }

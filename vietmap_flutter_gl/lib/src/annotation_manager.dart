@@ -128,8 +128,22 @@ abstract class AnnotationManager<T extends Annotation> {
   /// Fully dipose of all the the resouces managed by the annotation manager.
   /// The manager cannot be used after this has been called
   Future<void> dispose() async {
+    if (controller.isDisposed) return;
+
+    // De-register the callbacks registered in the constructor first, before
+    // anything below can throw. Otherwise a manager recreated after a style
+    // reload would leave the disposed manager's callbacks attached to the
+    // controller, which then resolve ids against an already cleared
+    // `_idToAnnotation` (jumpy drags, missing-key errors).
+    if (onTap != null) {
+      controller.onFeatureTapped.remove(_onFeatureTapped);
+    }
+    controller.onFeatureDrag.remove(_onDrag);
+
     _idToAnnotation.clear();
-    await _setAll();
+    // No _setAll() here: the sources are removed right below anyway, and when
+    // this runs because the style was replaced they are already gone - the
+    // setGeoJsonSource call would then hit a missing source on the native side.
     for (var i = 0; i < allLayerProperties.length; i++) {
       await controller.removeLayer(_makeLayerId(i));
       await controller.removeSource(_makeLayerId(i));
@@ -299,6 +313,13 @@ class SymbolManager extends AnnotationManager<Symbol> {
           iconHaloBlur: [Expressions.get, 'iconHaloBlur'],
           // note that web does not support setting this in a fully data driven
           // way this is a upstream issue
+          //
+          // The fallback stack must be one the style's glyph endpoint actually
+          // serves. VietMap serves Roboto and Noto Sans; asking it for the
+          // MapLibre demo stack ("Open Sans Regular", "Arial Unicode MS
+          // Regular") returns HTTP 400, and a symbol layer whose glyphs fail to
+          // load renders nothing at all - icons included. Pass [fontNames] in
+          // [SymbolOptions] to override this per symbol.
           textFont: kIsWeb
               ? null
               : [
@@ -307,7 +328,7 @@ class SymbolManager extends AnnotationManager<Symbol> {
                   [Expressions.get, 'fontNames'],
                   [
                     Expressions.literal,
-                    ["Open Sans Regular", "Arial Unicode MS Regular"]
+                    ["Roboto Regular", "Noto Sans Regular"]
                   ],
                 ],
           textField: [Expressions.get, 'textField'],

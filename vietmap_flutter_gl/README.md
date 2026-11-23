@@ -600,3 +600,14 @@ Vietmap API document [here](https://maps.vietmap.vn/docs/map-api/overview/)
 
 Have a bug to report? [Open an issue](https://github.com/vietmap-company/flutter-map-sdk/issues). If possible, include a full log and information that shows the issue.
 Have a feature request? [Open an issue](https://github.com/vietmap-company/flutter-map-sdk/issues). Tell us what the feature should do and why you want the feature.
+
+## Fork maintenance
+
+This fork aligns the plugin runtime and package metadata with the published
+`vietmap_flutter_gl` 4.1.2 release from pub.dev (archive SHA-256
+`70af388456699da28cd7b79655bc3776900272dde2e9e7c911265f30bda13d88`).
+The official Git default branch still contains the 4.1.0 implementation.
+
+The empty iOS `Package.swift` is removed so Flutter selects the existing
+CocoaPods integration for Vietmap while other plugins can use SwiftPM.
+No map API or native implementation is changed by that integration fix.

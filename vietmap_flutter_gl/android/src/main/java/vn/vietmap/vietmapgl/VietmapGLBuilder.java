@@ -107,6 +107,21 @@ class VietmapGLBuilder implements VietmapGLMapOptionsSink {
   }
 
   @Override
+  public void setDoubleClickZoomEnabled(boolean doubleClickZoomEnabled) {
+    options.doubleTapGesturesEnabled(doubleClickZoomEnabled);
+  }
+
+  @Override
+  public void setForegroundLoadColor(int loadColor) {
+    options.foregroundLoadColor(loadColor);
+  }
+
+  @Override
+  public void setTranslucentTextureSurface(boolean translucentTextureSurface) {
+    options.translucentTextureSurface(translucentTextureSurface);
+  }
+
+  @Override
   public void setMyLocationEnabled(boolean myLocationEnabled) {
     this.myLocationEnabled = myLocationEnabled;
   }

@@ -30,6 +30,14 @@ internal interface VietmapGLMapOptionsSink {
 
     fun setZoomGesturesEnabled(zoomGesturesEnabled: Boolean)
 
+    fun setDoubleClickZoomEnabled(doubleClickZoomEnabled: Boolean)
+
+    /** Android only: color shown while the map is still loading. */
+    fun setForegroundLoadColor(loadColor: Int)
+
+    /** Android only: enables a translucent texture surface (transparent map background). */
+    fun setTranslucentTextureSurface(translucentTextureSurface: Boolean)
+
     fun setMyLocationEnabled(myLocationEnabled: Boolean)
 
     fun setMyLocationTrackingMode(myLocationTrackingMode: Int)

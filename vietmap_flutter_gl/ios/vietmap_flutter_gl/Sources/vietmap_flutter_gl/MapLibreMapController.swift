@@ -26,6 +26,12 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
     private var isLogoEnabled = true
     private var interactiveFeatureLayerIds = Set<String>()
     private var addedShapesByLayer = [String: MLNShape]()
+    /// The map view's built-in double-tap-to-zoom recognizers, retained so
+    /// `setDoubleClickZoomEnabled` can toggle them.
+    private var doubleTapRecognizers = [UITapGestureRecognizer]()
+    /// In-flight offscreen snapshotter, retained so it survives until its
+    /// completion handler runs and so a new request can cancel it.
+    private var activeSnapshotter: MLNMapSnapshotter?
 
     func view() -> UIView {
         return mapView
@@ -57,8 +63,15 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
             target: self,
             action: #selector(handleMapTap(sender:))
         )
-        for recognizer in mapView.gestureRecognizers! where recognizer is UITapGestureRecognizer {
+        // Only wait for genuine double-tap recognizers to fail. Requiring
+        // *every* tap recognizer to fail also caught the single-tap recognizer
+        // of the map view's location indicator, which then swallowed
+        // onMapClick entirely, and added a ~300ms delay to every tap.
+        for recognizer in mapView.gestureRecognizers!
+            where (recognizer as? UITapGestureRecognizer)?.numberOfTapsRequired == 2
+        {
             singleTap.require(toFail: recognizer)
+            doubleTapRecognizers.append(recognizer as! UITapGestureRecognizer)
         }
         mapView.addGestureRecognizer(singleTap)
 
@@ -66,11 +79,6 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
             target: self,
             action: #selector(handleMapLongPress(sender:))
         )
-        for recognizer in mapView.gestureRecognizers!
-            where recognizer is UILongPressGestureRecognizer
-        {
-            longPress.require(toFail: recognizer)
-        }
         var longPressRecognizerAdded = false
 
         if let args = args as? [String: Any] {
@@ -372,6 +380,52 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
             } else {
                 mapView.setCamera(camera, animated: true)
                 completion()
+            }
+        case "camera#ease":
+            guard let arguments = methodCall.arguments as? [String: Any] else {
+                result(false)
+                return
+            }
+            guard let cameraUpdate = arguments["cameraUpdate"] as? [Any] else {
+                result(false)
+                return
+            }
+            guard let camera = Convert.parseCameraUpdate(
+                cameraUpdate: cameraUpdate,
+                mapView: mapView
+            ) else {
+                result(false)
+                return
+            }
+
+            let easeCompletion = {
+                result(true)
+            }
+
+            if let duration = arguments["duration"] as? Double, duration > 0 {
+                let timingFunction: CAMediaTimingFunction
+                switch arguments["interpolation"] as? String {
+                case "linear":
+                    timingFunction = CAMediaTimingFunction(name: .linear)
+                case "easeOut":
+                    timingFunction = CAMediaTimingFunction(name: .easeOut)
+                case "fastOutLinearIn":
+                    // Material Design "fast out, linear in" cubic Bezier.
+                    timingFunction = CAMediaTimingFunction(controlPoints: 0.4, 0.0, 1.0, 1.0)
+                default:
+                    // Covers "easeInOut" and an absent interpolation.
+                    timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+                }
+
+                mapView.setCamera(
+                    camera,
+                    withDuration: duration / 1000.0,
+                    animationTimingFunction: timingFunction,
+                    completionHandler: easeCompletion
+                )
+            } else {
+                mapView.setCamera(camera, animated: true)
+                easeCompletion()
             }
         case "symbolLayer#add":
             guard let arguments = methodCall.arguments as? [String: Any] else { return }
@@ -961,6 +1015,67 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
             var reply = [String: NSObject]()
             reply["filter"] = currentLayerFilter as NSObject
             result(reply)
+
+        case "map#takeSnapshot":
+            guard let styleURL = mapView.styleURL else {
+                result(FlutterError(
+                    code: "STYLE_NOT_READY",
+                    message: "Map style is not loaded",
+                    details: nil
+                ))
+                return
+            }
+
+            let snapshotArgs = methodCall.arguments as? [String: Any]
+            let snapshotWidth = snapshotArgs?["width"] as? Int ?? Int(mapView.bounds.width)
+            let snapshotHeight = snapshotArgs?["height"] as? Int ?? Int(mapView.bounds.height)
+            guard snapshotWidth > 0, snapshotHeight > 0 else {
+                result(FlutterError(
+                    code: "SNAPSHOT_ERROR",
+                    message: "Invalid snapshot size \(snapshotWidth)x\(snapshotHeight)",
+                    details: nil
+                ))
+                return
+            }
+
+            // Cancel any in-progress snapshot before starting a new one.
+            activeSnapshotter?.cancel()
+
+            let snapshotOptions = MLNMapSnapshotOptions(
+                styleURL: styleURL,
+                camera: mapView.camera,
+                size: CGSize(width: snapshotWidth, height: snapshotHeight)
+            )
+            snapshotOptions.zoomLevel = mapView.zoomLevel
+
+            let snapshotter = MLNMapSnapshotter(options: snapshotOptions)
+            // Hold a strong reference before starting, otherwise the snapshotter
+            // is deallocated before the completion handler runs.
+            activeSnapshotter = snapshotter
+
+            snapshotter.start { [weak self] snapshot, error in
+                self?.activeSnapshotter = nil
+
+                if let error = error {
+                    result(FlutterError(
+                        code: "SNAPSHOT_ERROR",
+                        message: error.localizedDescription,
+                        details: nil
+                    ))
+                    return
+                }
+                guard let snapshot = snapshot,
+                      let pngData = snapshot.image.pngData()
+                else {
+                    result(FlutterError(
+                        code: "SNAPSHOT_ERROR",
+                        message: "Failed to generate snapshot",
+                        details: nil
+                    ))
+                    return
+                }
+                result(FlutterStandardTypedData(bytes: pngData))
+            }
 
         default:
             result(FlutterMethodNotImplemented)
@@ -1771,6 +1886,12 @@ class MapLibreMapController: NSObject, FlutterPlatformView, MLNMapViewDelegate, 
 
     func setZoomGesturesEnabled(zoomGesturesEnabled: Bool) {
         mapView.allowsZooming = zoomGesturesEnabled
+    }
+
+    func setDoubleClickZoomEnabled(doubleClickZoomEnabled: Bool) {
+        for recognizer in doubleTapRecognizers {
+            recognizer.isEnabled = doubleClickZoomEnabled
+        }
     }
 
     func setMyLocationEnabled(myLocationEnabled: Bool) {

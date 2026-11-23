@@ -19,6 +19,21 @@ Future<void> installOfflineMapTiles(String tilesDb) async {
 
 enum DragEventType { start, drag, end }
 
+/// Phase of a pointer-hover interaction over a feature.
+///
+/// **Web only.** Android and iOS have no pointer-hover concept, so
+/// [VietmapController.onFeatureHover] never fires there.
+enum HoverEventType {
+  /// The pointer moved onto the feature.
+  enter,
+
+  /// The pointer moved while still over the feature.
+  move,
+
+  /// The pointer moved off the feature.
+  leave,
+}
+
 Future<dynamic> setOffline(bool offline) => _globalChannel.invokeMethod(
       'setOffline',
       <String, dynamic>{

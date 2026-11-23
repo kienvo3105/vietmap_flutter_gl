@@ -7,5 +7,5 @@ part of '../vietmap_flutter_gl.dart';
 abstract class VietmapStyles {
   /// A very simple VietmapGL demo style that shows only countries with their
   /// boundaries.
-  static const String demo = "https://demotiles.maplibre.org/style.json";
+  static const String demo = "https://maps.vietmap.vn/maps/styles/tm/style.json?apikey=YOUR_TILEMAP_KEY";
 }

@@ -30,6 +30,8 @@ class VietmapGL extends StatefulWidget {
     this.zoomGesturesEnabled = true,
     this.tiltGesturesEnabled = true,
     this.doubleClickZoomEnabled,
+    this.foregroundLoadColor,
+    this.translucentTextureSurface,
     this.dragEnabled = true,
     this.trackCameraPosition = false,
     this.myLocationEnabled = false,
@@ -46,6 +48,7 @@ class VietmapGL extends StatefulWidget {
     this.onMapLongClick,
     this.onCameraTrackingDismissed,
     this.onCameraTrackingChanged,
+    this.onCameraMove,
     this.onCameraIdle,
     this.onMapIdle,
     this.isCustomizeUserIcon = true,
@@ -161,8 +164,19 @@ class VietmapGL extends StatefulWidget {
   /// Set to true to forcefully disable/enable if map should respond to double
   /// click to zoom.
   ///
-  /// This takes presedence over zoomGesturesEnabled. Only supported for web.
+  /// This takes presedence over zoomGesturesEnabled.
   final bool? doubleClickZoomEnabled;
+
+  /// The color painted behind the map while it is still loading.
+  ///
+  /// **Android only.** Has no effect on iOS or web.
+  final Color? foregroundLoadColor;
+
+  /// Enables a translucent texture surface so that widgets behind the map show
+  /// through. Useful for overlay/layered layouts.
+  ///
+  /// **Android only.** Has no effect on iOS or web.
+  final bool? translucentTextureSurface;
 
   /// True if you want to be notified of map camera movements by the [VietmapController]. Default is false.
   ///
@@ -247,6 +261,13 @@ class VietmapGL extends StatefulWidget {
 
   /// Called when the location tracking mode changes
   final OnCameraTrackingChangedCallback? onCameraTrackingChanged;
+
+  /// Called continuously while the camera is moving, with the current
+  /// [CameraPosition].
+  ///
+  /// On Android and iOS this requires [trackCameraPosition] to be `true`,
+  /// otherwise the native side never emits intermediate camera positions.
+  final OnCameraMoveCallback? onCameraMove;
 
   // Called when camera movement has ended.
   final OnCameraIdleCallback? onCameraIdle;
@@ -347,6 +368,7 @@ class _VietmapGLState extends State<VietmapGL> {
         onMapLongClick: widget.onMapLongClick,
         onCameraTrackingDismissed: widget.onCameraTrackingDismissed,
         onCameraTrackingChanged: widget.onCameraTrackingChanged,
+        onCameraMove: widget.onCameraMove,
         onCameraIdle: widget.onCameraIdle,
         onMapIdle: widget.onMapIdle,
         annotationOrder: widget.annotationOrder,
@@ -386,6 +408,8 @@ class _VietmapOptions {
     this.compassViewMargins,
     this.attributionButtonPosition,
     this.attributionButtonMargins,
+    this.foregroundLoadColor,
+    this.translucentTextureSurface,
     // this.locationEnginePlatforms
   });
 
@@ -412,7 +436,13 @@ class _VietmapOptions {
           compassViewMargins: map.compassViewMargins,
           attributionButtonPosition: map.attributionButtonPosition,
           attributionButtonMargins: map.attributionButtonMargins,
+          foregroundLoadColor: map.foregroundLoadColor,
+          translucentTextureSurface: map.translucentTextureSurface,
         );
+
+  final Color? foregroundLoadColor;
+
+  final bool? translucentTextureSurface;
 
   final bool? compassEnabled;
 
@@ -500,6 +530,11 @@ class _VietmapOptions {
     addIfNonNull('attributionButtonPosition', attributionButtonPosition?.index);
     addIfNonNull(
         'attributionButtonMargins', pointToArray(attributionButtonMargins));
+    // `.value` rather than `toARGB32()` to stay within the package's declared
+    // minimum Flutter version (toARGB32 only exists from 3.27).
+    // ignore: deprecated_member_use
+    addIfNonNull('foregroundLoadColor', foregroundLoadColor?.value);
+    addIfNonNull('translucentTextureSurface', translucentTextureSurface);
     // addIfNonNull('locationEngineProperties', locationEnginePlatforms?.toList());
     return optionsMap;
   }
@@ -519,7 +554,12 @@ class _VietmapOptions {
         if (_gestureGroup.contains(key)) return !gesturesRequireUpdate;
         final oldValue = prevOptionsMap[key];
         if (oldValue is List && value is List) {
-          return listEquals(oldValue, value);
+          // Use a deep equality check so that nested structures (e.g. the
+          // serialized `cameraTargetBounds`, which becomes a list of lists of
+          // lists) are compared by value. `listEquals` only compares the
+          // top-level elements with `==`, which always reports nested lists
+          // as unequal because Dart's `List` does not override `==`.
+          return const DeepCollectionEquality().equals(oldValue, value);
         }
         return oldValue == value;
       });

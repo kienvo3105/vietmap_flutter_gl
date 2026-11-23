@@ -43,6 +43,7 @@ import 'dart:io';
 import 'package:supercluster/supercluster.dart';
 // import 'package:geolocator/geolocator.dart';
 
+import 'package:collection/collection.dart';
 import 'package:turf/turf.dart' as turf;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';
@@ -58,6 +59,7 @@ export 'package:vietmap_gl_platform_interface/vietmap_gl_platform_interface.dart
         Annotation,
         ArgumentCallbacks,
         AttributionButtonPosition,
+        CameraAnimationInterpolation,
         CameraPosition,
         CameraTargetBounds,
         CameraUpdate,

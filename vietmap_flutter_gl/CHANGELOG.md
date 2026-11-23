@@ -1,3 +1,24 @@
+## 4.1.2, Nov 20, 2026
+
+### Fixed
+* Android: `onStyleLoadedCallback` was sometimes never called, and the my-location component was not enabled. This happened when the first style request failed temporarily (for example a timeout) and the SDK's automatic retry then loaded the style. Both now run once the style finishes loading, including after a retry.
+
+## 4.1.1, Aug 5, 2026
+
+Requires `vietmap_gl_platform_interface: ^1.1.0-pre.1` and `vietmap_flutter_gl_web: ^0.0.2-pre.1`.
+
+### Added
+* `VietmapController.takeSnapshot({width, height})` - to snapshot at a size other than the current map view.
+* `VietmapController.easeCamera(cameraUpdate, {duration, interpolation})` with the
+  `CameraAnimationInterpolation` enum (`linear`, `easeInOut`, `easeOut`, `fastOutLinearIn`).
+* `onCameraMove` callback on `VietmapGL` and `VietmapController`. Requires
+  `trackCameraPosition: true` on Android/iOS.
+* `VietmapController.onFeatureHover` and the `HoverEventType` enum
+  (`enter`, `move`, `leave`), for layers added with `enableInteraction: true`.
+  Web only - Android and iOS have no pointer-hover concept.
+* `VietmapGL.doubleClickZoomEnabled` to turn off double-tap-to-zoom independently of
+  the other zoom gestures.
+
 ## 4.0.1, Mar 27, 2025
 * Improve MarkerLayer performance, ensure smoother movement.
 ## 4.0.0, Mar 3, 2025

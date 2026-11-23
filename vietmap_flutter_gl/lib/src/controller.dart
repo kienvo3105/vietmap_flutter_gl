@@ -17,6 +17,15 @@ typedef OnFeatureDragnCallback = void Function(dynamic id,
     required LatLng delta,
     required DragEventType eventType});
 
+/// Signature of [VietmapController.onFeatureHover] listeners.
+///
+/// Mirrors [OnFeatureInteractionCallback] with the hover phase appended.
+///
+/// **Web only** - see [HoverEventType].
+typedef OnFeatureHoverCallback = void Function(dynamic id,
+    Point<double> point, LatLng coordinates, String layerId,
+    HoverEventType eventType);
+
 typedef OnMapLongClickCallback = void Function(
     Point<double> point, LatLng coordinates);
 
@@ -31,6 +40,8 @@ typedef OnDidFinishedRenderingFrame = void Function();
 typedef OnCameraTrackingDismissedCallback = void Function();
 typedef OnCameraTrackingChangedCallback = void Function(
     MyLocationTrackingMode mode);
+
+typedef OnCameraMoveCallback = void Function(CameraPosition cameraPosition);
 
 typedef OnCameraIdleCallback = void Function();
 
@@ -95,6 +106,7 @@ class VietmapController extends ChangeNotifier {
     this.onMapFirstRendered,
     this.onUserLocationUpdated,
     this.onCameraIdle,
+    this.onCameraMove,
   }) : _vietmapGLPlatform = vietmapGLPlatform {
     _cameraPosition = initialCameraPosition;
 
@@ -138,14 +150,24 @@ class VietmapController extends ChangeNotifier {
       }
     });
 
+    _vietmapGLPlatform.onFeatureHoverPlatform.add((payload) {
+      final eventType = HoverEventType.values
+          .firstWhere((element) => element.name == payload["eventType"]);
+      for (final fun in List<OnFeatureHoverCallback>.from(onFeatureHover)) {
+        fun(payload["id"], payload["point"], payload["latLng"],
+            payload["layerId"], eventType);
+      }
+    });
+
     _vietmapGLPlatform.onCameraMoveStartedPlatform.add((_) {
       _isCameraMoving = true;
-      notifyListeners();
+      if (!isDisposed) notifyListeners();
     });
 
     _vietmapGLPlatform.onCameraMovePlatform.add((cameraPosition) {
       _cameraPosition = cameraPosition;
-      notifyListeners();
+      onCameraMove?.call(cameraPosition);
+      if (!isDisposed) notifyListeners();
     });
 
     _vietmapGLPlatform.onCameraIdlePlatform.add((cameraPosition) {
@@ -154,10 +176,34 @@ class VietmapController extends ChangeNotifier {
         _cameraPosition = cameraPosition;
       }
       onCameraIdle?.call();
-      notifyListeners();
+      if (!isDisposed) notifyListeners();
     });
 
-    _vietmapGLPlatform.onMapStyleLoadedPlatform.add((_) {
+    _vietmapGLPlatform.onMapStyleLoadedPlatform.add((_) async {
+      // Dispose the managers of the previous style before re-creating them.
+      // Their layers/sources are already gone with the old style, so the
+      // removeLayer/removeSource calls inside dispose() may throw - what
+      // matters here is that each manager de-registers its tap/drag
+      // callbacks. Without this the controller accumulates callbacks from
+      // every style load, and stale managers keep resolving ids against an
+      // already cleared annotation map.
+      try {
+        await polygonManager?.dispose();
+      } catch (_) {}
+      polygonManager = null;
+      try {
+        await polylineManager?.dispose();
+      } catch (_) {}
+      polylineManager = null;
+      try {
+        await circleManager?.dispose();
+      } catch (_) {}
+      circleManager = null;
+      try {
+        await symbolManager?.dispose();
+      } catch (_) {}
+      symbolManager = null;
+
       final interactionEnabled = annotationConsumeTapEvents.toSet();
       for (final type in annotationOrder.toSet()) {
         final enableInteraction = interactionEnabled.contains(type);
@@ -225,6 +271,13 @@ class VietmapController extends ChangeNotifier {
   final OnDidFinishedRenderingFrame? onDidFinishedRenderingFrame;
   final OnCameraTrackingChangedCallback? onCameraTrackingChanged;
 
+  /// Called while the camera is moving.
+  ///
+  /// On Android and iOS this only fires if [VietmapGL.trackCameraPosition] is
+  /// set to `true`, since the native side does not report intermediate camera
+  /// positions otherwise. On web it always fires.
+  final OnCameraMoveCallback? onCameraMove;
+
   final OnCameraIdleCallback? onCameraIdle;
 
   final OnMapIdleCallback? onMapIdle;
@@ -243,6 +296,14 @@ class VietmapController extends ChangeNotifier {
   final onFeatureTapped = <OnFeatureInteractionCallback>[];
 
   final onFeatureDrag = <OnFeatureDragnCallback>[];
+
+  /// Callbacks to receive hover events for features (geojson layer) placed on
+  /// this map.
+  ///
+  /// **Web only.** Android and iOS have no pointer-hover concept, so these
+  /// callbacks never fire there. Register the layer with
+  /// `enableInteraction: true` for hover events to be emitted.
+  final onFeatureHover = <OnFeatureHoverCallback>[];
 
   /// Callbacks to receive tap events for info windows on symbols
   @Deprecated("InfoWindow tapped is no longer supported")
@@ -283,6 +344,12 @@ class VietmapController extends ChangeNotifier {
 
   final VietmapGlPlatform _vietmapGLPlatform; //ignore: unused_field
 
+  /// Tracks whether the controller has already been disposed
+  bool _isDisposed = false;
+
+  /// Return whether the controller has already been disposed.
+  bool get isDisposed => _isDisposed;
+
   /// Updates configuration options of the map user interface.
   ///
   /// Change listeners are notified once the update has been made on the
@@ -291,7 +358,7 @@ class VietmapController extends ChangeNotifier {
   /// The returned [Future] completes after listeners have been notified.
   Future<void> _updateMapOptions(Map<String, dynamic> optionsUpdate) async {
     _cameraPosition = await _vietmapGLPlatform.updateMapOptions(optionsUpdate);
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
   }
 
   /// Triggers a resize event for the map on web (ignored on Android or iOS).
@@ -331,6 +398,32 @@ class VietmapController extends ChangeNotifier {
   /// Note: this currently always returns immediately with a value of null on iOS
   Future<bool?> moveCamera(CameraUpdate cameraUpdate) async {
     return _vietmapGLPlatform.moveCamera(cameraUpdate);
+  }
+
+  /// Eases the camera with an explicit easing curve.
+  ///
+  /// Unlike [animateCamera], which always uses the platform's default
+  /// ease-in/ease-out, this lets you pick the [interpolation]. Use
+  /// [CameraAnimationInterpolation.linear] when continuously following a
+  /// moving target (e.g. a GPS position): the default eased curve decelerates
+  /// at the end of every call, so chaining calls produces a visible
+  /// stutter at each hand-off.
+  ///
+  /// See [CameraAnimationInterpolation] for per-platform support - Android's
+  /// native SDK only distinguishes linear from eased.
+  ///
+  /// It returns true if the camera was successfully moved and false if the
+  /// movement was canceled.
+  Future<bool?> easeCamera(
+    CameraUpdate cameraUpdate, {
+    Duration? duration,
+    CameraAnimationInterpolation? interpolation,
+  }) async {
+    return _vietmapGLPlatform.easeCamera(
+      cameraUpdate,
+      duration: duration,
+      interpolation: interpolation,
+    );
   }
 
   /// Adds a new geojson source
@@ -375,7 +468,7 @@ class VietmapController extends ChangeNotifier {
         circleManager?.addAll(circleAnnotation ?? []);
         symbolManager?.addAll(symbolAnnotation ?? []);
 
-        notifyListeners();
+        if (!isDisposed) notifyListeners();
       });
     }
   }
@@ -804,7 +897,7 @@ class VietmapController extends ChangeNotifier {
     final effectiveOptions = SymbolOptions.defaultOptions.copyWith(options);
     final symbol = Symbol(getRandomString(), effectiveOptions, data);
     await symbolManager!.add(symbol);
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
     return symbol;
   }
 
@@ -825,7 +918,7 @@ class VietmapController extends ChangeNotifier {
     ];
     await symbolManager!.addAll(symbols);
 
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
     return symbols;
   }
 
@@ -840,7 +933,7 @@ class VietmapController extends ChangeNotifier {
     await symbolManager!
         .set(symbol..options = symbol.options.copyWith(changes));
 
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
   }
 
   /// Retrieves the current position of the symbol.
@@ -859,7 +952,7 @@ class VietmapController extends ChangeNotifier {
   /// The returned [Future] completes once listeners have been notified.
   Future<void> removeSymbol(Symbol symbol) async {
     await symbolManager!.remove(symbol);
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
   }
 
   /// Removes the specified [symbols] from the map. The symbols must be current
@@ -871,7 +964,7 @@ class VietmapController extends ChangeNotifier {
   /// The returned [Future] completes once listeners have been notified.
   Future<void> removeSymbols(Iterable<Symbol> symbols) async {
     await symbolManager!.removeAll(symbols);
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
   }
 
   /// Removes all [symbols] from the map added with the [addSymbol] or [addSymbols] methods.
@@ -882,7 +975,7 @@ class VietmapController extends ChangeNotifier {
   /// The returned [Future] completes once listeners have been notified.
   Future<void> clearSymbols() async {
     symbolManager!.clear();
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
   }
 
   /// Adds a line to the map, configured using the specified custom [options].
@@ -896,7 +989,7 @@ class VietmapController extends ChangeNotifier {
     final effectiveOptions = PolylineOptions.defaultOptions.copyWith(options);
     final line = Line(getRandomString(), effectiveOptions, data);
     await polylineManager!.add(line);
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
     return line;
   }
 
@@ -916,7 +1009,7 @@ class VietmapController extends ChangeNotifier {
     ];
     await polylineManager!.addAll(lines);
 
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
     return lines;
   }
 
@@ -930,7 +1023,7 @@ class VietmapController extends ChangeNotifier {
   Future<void> updatePolyline(Line line, PolylineOptions changes) async {
     line.options = line.options.copyWith(changes);
     await polylineManager!.set(line);
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
   }
 
   /// Retrieves the current position of the line.
@@ -949,7 +1042,7 @@ class VietmapController extends ChangeNotifier {
   /// The returned [Future] completes once listeners have been notified.
   Future<void> removePolyline(Line line) async {
     await polylineManager!.remove(line);
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
   }
 
   /// Removes the specified [lines] from the map. The lines must be current
@@ -961,7 +1054,7 @@ class VietmapController extends ChangeNotifier {
   /// The returned [Future] completes once listeners have been notified.
   Future<void> removePolylines(Iterable<Line> lines) async {
     await polylineManager!.removeAll(lines);
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
   }
 
   /// Removes all [lines] from the map added with the [addPolyline] or [addPolylines] methods.
@@ -972,7 +1065,7 @@ class VietmapController extends ChangeNotifier {
   /// The returned [Future] completes once listeners have been notified.
   Future<void> clearPolylines() async {
     await polylineManager!.clear();
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
   }
 
   /// Removes the specified [lines] from the map. The lines must be current
@@ -985,7 +1078,7 @@ class VietmapController extends ChangeNotifier {
   @Deprecated('Use removePolylines instead')
   Future<void> removeLines(Iterable<Line> lines) async {
     await polylineManager?.removeAll(lines);
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
   }
 
   /// Removes all [polylines] from the map.
@@ -997,7 +1090,7 @@ class VietmapController extends ChangeNotifier {
   @Deprecated('Use clearPolylines instead')
   Future<void> clearLines() async {
     await polylineManager?.clear();
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
   }
 
   /// Adds a circle to the map, configured using the specified custom [options].
@@ -1011,7 +1104,7 @@ class VietmapController extends ChangeNotifier {
     final effectiveOptions = CircleOptions.defaultOptions.copyWith(options);
     final circle = Circle(getRandomString(), effectiveOptions, data);
     await circleManager!.add(circle);
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
     return circle;
   }
 
@@ -1036,7 +1129,7 @@ class VietmapController extends ChangeNotifier {
     ];
     await circleManager!.addAll(cricles);
 
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
     return cricles;
   }
 
@@ -1051,7 +1144,7 @@ class VietmapController extends ChangeNotifier {
     circle.options = circle.options.copyWith(changes);
     await circleManager!.set(circle);
 
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
   }
 
   /// Retrieves the current position of the circle.
@@ -1071,7 +1164,7 @@ class VietmapController extends ChangeNotifier {
   Future<void> removeCircle(Circle circle) async {
     circleManager!.remove(circle);
 
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
   }
 
   /// Removes the specified [circles] from the map. The circles must be current
@@ -1083,7 +1176,7 @@ class VietmapController extends ChangeNotifier {
   /// The returned [Future] completes once listeners have been notified.
   Future<void> removeCircles(Iterable<Circle> circles) async {
     await circleManager!.removeAll(circles);
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
   }
 
   /// Removes all [circles] from the map added with the [addCircle] or [addCircles] methods.
@@ -1095,7 +1188,7 @@ class VietmapController extends ChangeNotifier {
   Future<void> clearCircles() async {
     circleManager!.clear();
 
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
   }
 
   /// Adds a fill to the map, configured using the specified custom [options].
@@ -1109,7 +1202,7 @@ class VietmapController extends ChangeNotifier {
     final effectiveOptions = PolygonOptions.defaultOptions.copyWith(options);
     final fill = Polygon(getRandomString(), effectiveOptions, data);
     await polygonManager!.add(fill);
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
     return fill;
   }
 
@@ -1130,7 +1223,7 @@ class VietmapController extends ChangeNotifier {
     ];
     await polygonManager!.addAll(fills);
 
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
     return fills;
   }
 
@@ -1145,7 +1238,7 @@ class VietmapController extends ChangeNotifier {
     fill.options = fill.options.copyWith(changes);
     await polygonManager!.set(fill);
 
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
   }
 
   /// Removes all [fills] from the map added with the [addPolygon] or [addPolygons] methods.
@@ -1157,7 +1250,7 @@ class VietmapController extends ChangeNotifier {
   Future<void> clearPolygons() async {
     await polygonManager!.clear();
 
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
   }
 
   /// Removes the specified [fill] from the map. The fill must be a current
@@ -1169,7 +1262,7 @@ class VietmapController extends ChangeNotifier {
   /// The returned [Future] completes once listeners have been notified.
   Future<void> removePolygon(Polygon fill) async {
     await polygonManager!.remove(fill);
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
   }
 
   /// Removes the specified [fills] from the map. The fills must be current
@@ -1181,7 +1274,7 @@ class VietmapController extends ChangeNotifier {
   /// The returned [Future] completes once listeners have been notified.
   Future<void> removeFills(Iterable<Polygon> fills) async {
     await polygonManager!.removeAll(fills);
-    notifyListeners();
+    if (!isDisposed) notifyListeners();
   }
 
   /// Query rendered (i.e. visible) features at a point in screen coordinates
@@ -1434,7 +1527,7 @@ class VietmapController extends ChangeNotifier {
       double? maxzoom,
       dynamic filter}) async {
     if (properties is FillLayerProperties) {
-      addFillLayer(sourceId, layerId, properties,
+      await addFillLayer(sourceId, layerId, properties,
           belowLayerId: belowLayerId,
           enableInteraction: enableInteraction,
           sourceLayer: sourceLayer,
@@ -1442,13 +1535,13 @@ class VietmapController extends ChangeNotifier {
           maxzoom: maxzoom,
           filter: filter);
     } else if (properties is FillExtrusionLayerProperties) {
-      addFillExtrusionLayer(sourceId, layerId, properties,
+      await addFillExtrusionLayer(sourceId, layerId, properties,
           belowLayerId: belowLayerId,
           sourceLayer: sourceLayer,
           minzoom: minzoom,
           maxzoom: maxzoom);
     } else if (properties is LineLayerProperties) {
-      addLineLayer(sourceId, layerId, properties,
+      await addLineLayer(sourceId, layerId, properties,
           belowLayerId: belowLayerId,
           enableInteraction: enableInteraction,
           sourceLayer: sourceLayer,
@@ -1456,7 +1549,7 @@ class VietmapController extends ChangeNotifier {
           maxzoom: maxzoom,
           filter: filter);
     } else if (properties is SymbolLayerProperties) {
-      addSymbolLayer(sourceId, layerId, properties,
+      await addSymbolLayer(sourceId, layerId, properties,
           belowLayerId: belowLayerId,
           enableInteraction: enableInteraction,
           sourceLayer: sourceLayer,
@@ -1464,7 +1557,7 @@ class VietmapController extends ChangeNotifier {
           maxzoom: maxzoom,
           filter: filter);
     } else if (properties is CircleLayerProperties) {
-      addCircleLayer(sourceId, layerId, properties,
+      await addCircleLayer(sourceId, layerId, properties,
           belowLayerId: belowLayerId,
           enableInteraction: enableInteraction,
           sourceLayer: sourceLayer,
@@ -1475,7 +1568,7 @@ class VietmapController extends ChangeNotifier {
       if (filter != null) {
         throw UnimplementedError("RasterLayer does not support filter");
       }
-      addRasterLayer(sourceId, layerId, properties,
+      await addRasterLayer(sourceId, layerId, properties,
           belowLayerId: belowLayerId,
           sourceLayer: sourceLayer,
           minzoom: minzoom,
@@ -1484,13 +1577,13 @@ class VietmapController extends ChangeNotifier {
       if (filter != null) {
         throw UnimplementedError("HillShadeLayer does not support filter");
       }
-      addHillshadeLayer(sourceId, layerId, properties,
+      await addHillshadeLayer(sourceId, layerId, properties,
           belowLayerId: belowLayerId,
           sourceLayer: sourceLayer,
           minzoom: minzoom,
           maxzoom: maxzoom);
     } else if (properties is HeatmapLayerProperties) {
-      addHeatmapLayer(sourceId, layerId, properties,
+      await addHeatmapLayer(sourceId, layerId, properties,
           belowLayerId: belowLayerId,
           sourceLayer: sourceLayer,
           minzoom: minzoom,
@@ -1517,8 +1610,27 @@ class VietmapController extends ChangeNotifier {
         .toList();
   }
 
+  /// Takes a snapshot of the current map and returns it as PNG bytes.
+  ///
+  /// If [width] and [height] are given the snapshot is rendered at that size
+  /// (in logical pixels) by an offscreen renderer, keeping the current camera
+  /// position and style. When omitted the snapshot matches the current map
+  /// view size.
+  ///
+  /// The offscreen renderer re-fetches the style, so runtime additions made
+  /// through the controller (annotations, layers added with [addLayer], images
+  /// registered with [addImage]) are **not** part of the result - only what
+  /// the style itself defines.
+  ///
+  /// Throws a [PlatformException] if the style is not loaded yet or the
+  /// snapshot fails.
+  Future<Uint8List> takeSnapshot({int? width, int? height}) {
+    return _vietmapGLPlatform.takeSnapshot(width: width, height: height);
+  }
+
   @override
   void dispose() {
+    _isDisposed = true;
     super.dispose();
     _vietmapGLPlatform.dispose();
   }

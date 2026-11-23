@@ -39,16 +39,48 @@ class UserLocationLayer extends StatefulWidget {
 }
 
 class _UserLocationLayerState extends State<UserLocationLayer> {
+  /// How often the initial position is polled before giving up.
+  ///
+  /// The controller reaches Dart as soon as the platform view exists, which is
+  /// well before the style finishes loading and the native location component
+  /// is built, so the first attempts legitimately return null.
+  static const _initialLocationAttempts = 12;
+  static const _initialLocationRetryDelay = Duration(milliseconds: 500);
+
+  /// How long to wait for the map to report a camera event before projecting
+  /// anyway. Only reached by maps that never move (no tracking mode, no
+  /// gesture); everything else settles well inside this.
+  static const _settleFallback = Duration(milliseconds: 1500);
+
   VietmapController get _mapController => widget.mapController;
   MarkerState? _positionMarkerStates;
   UserLocation? _currentPosition;
+
+  /// Set once a position from the device has been received. Until then nothing
+  /// is drawn - showing the marker at the camera target would put the "you are
+  /// here" dot at a place the user has never been.
+  bool _hasFix = false;
+
+  /// Set once the map has reported a camera event, which is the first point at
+  /// which projecting a coordinate to a screen point gives a usable answer.
+  ///
+  /// iOS hands out `mapView.userLocation` from CoreLocation's cached fix, often
+  /// within milliseconds of the platform view being created - long before the
+  /// map view is laid out and the initial camera applied. Projecting then
+  /// returns a point near the origin, which is what parked the marker in the
+  /// top-left corner until the camera settled a few seconds later.
+  bool _mapSettled = false;
+  Timer? _settleTimer;
+
   // ignore: use_late_for_private_fields_and_variables
   Widget? _child;
   double _pulseSize = 0;
   LatLng? _location;
   Point<num>? _initialPosition;
+
   double get _iconSize => widget.iconSize;
   double lastBearing = 0;
+
   @override
   void didUpdateWidget(covariant UserLocationLayer oldWidget) {
     _updatePulseSize();
@@ -82,6 +114,7 @@ class _UserLocationLayerState extends State<UserLocationLayer> {
 
   Function()? onMapListener;
   Function(CameraPosition?)? onLocationMarkerListener;
+  Function(UserLocation)? onUserLocationListener;
 
   @override
   void initState() {
@@ -93,72 +126,118 @@ class _UserLocationLayerState extends State<UserLocationLayer> {
       _updateUserLocationWidget();
     };
     onLocationMarkerListener = (cameraPosition) {
+      _markMapSettled();
       _updateUserLocationPosition();
     };
     _mapController.getPlatform.onCameraIdlePlatform
         .add(onLocationMarkerListener!);
     _mapController.addListener(onMapListener!);
-    _mapController.getPlatform.onUserLocationUpdatedPlatform.add((event) {
+    onUserLocationListener = (event) {
       _currentPosition = event;
       if (_currentPosition == null) return;
+      _onFirstFix();
 
-      final location = LatLng(_currentPosition?.position.latitude ?? 0,
-          _currentPosition?.position.longitude ?? 0);
-      _mapController.toScreenLocationBatch([location]).then((value) async {
-        if (Platform.isAndroid) {
-          await Future.delayed(const Duration(milliseconds: 20));
-        }
-        if (mounted) {
-          setState(() {
-            _location = location;
-            _initialPosition = value.first;
-          });
-        }
-      });
+      _placeMarkerAt(LatLng(_currentPosition?.position.latitude ?? 0,
+          _currentPosition?.position.longitude ?? 0));
       _updatePulseSize();
       _updateUserLocationPosition();
       _updateUserLocationWidget();
-    });
+    };
+    _mapController.getPlatform.onUserLocationUpdatedPlatform
+        .add(onUserLocationListener!);
     super.initState();
 
-    WidgetsBinding.instance.addPostFrameCallback((timeStamp) async {
-      final currentLatLng = await _mapController.requestMyLocationLatLng();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _requestInitialFix());
+  }
+
+  /// Records the first position and arms the fallback that releases the marker
+  /// even if the map never emits a camera event.
+  void _onFirstFix() {
+    if (_hasFix) return;
+    _hasFix = true;
+    if (!_mapSettled) {
+      _settleTimer = Timer(_settleFallback, _markMapSettled);
+    }
+  }
+
+  void _markMapSettled() {
+    if (_mapSettled) return;
+    _mapSettled = true;
+    _settleTimer?.cancel();
+    _settleTimer = null;
+
+    // Re-project now that the map is on screen: the point stored before this
+    // was computed against a viewport that was not laid out yet.
+    final position = _currentPosition?.position;
+    if (position != null) {
+      _placeMarkerAt(position);
+    } else if (mounted) {
+      setState(() {});
+    }
+  }
+
+  /// Polls the platform for the last known position until one arrives.
+  ///
+  /// Returning null is the normal answer while the map is still setting itself
+  /// up, so a single attempt - which is what this used to do - almost always
+  /// came back empty and left the layer with no position at all.
+  Future<void> _requestInitialFix() async {
+    for (var attempt = 0; attempt < _initialLocationAttempts; attempt++) {
+      if (!mounted || _hasFix) return;
+
+      LatLng? currentLatLng;
+      try {
+        currentLatLng = await _mapController.requestMyLocationLatLng();
+      } catch (_) {
+        // Platform side refused (permission revoked, location off). Keep the
+        // marker hidden; live updates may still arrive later.
+        return;
+      }
+      if (!mounted || _hasFix) return;
+
       if (currentLatLng != null) {
-        if (mounted) {
-          setState(() {
-            _currentPosition = UserLocation(
-                position: currentLatLng,
-                altitude: 0,
-                bearing: 0,
-                speed: 0,
-                horizontalAccuracy: 0,
-                verticalAccuracy: 0,
-                timestamp: DateTime.now(),
-                heading: null);
-          });
-        }
-      }
-    });
-    // if (currentPosition == null) return;
-    final location =
-        widget.mapController.cameraPosition?.target ?? const LatLng(0, 0);
-    _mapController.toScreenLocationBatch([location]).then((value) async {
-      if (Platform.isAndroid) {
-        await Future.delayed(const Duration(milliseconds: 20));
-      }
-      if (mounted) {
+        _onFirstFix();
         setState(() {
-          _location = location;
-          _initialPosition = value.first;
+          _currentPosition = UserLocation(
+              position: currentLatLng!,
+              altitude: 0,
+              bearing: 0,
+              speed: 0,
+              horizontalAccuracy: 0,
+              verticalAccuracy: 0,
+              timestamp: DateTime.now(),
+              heading: null);
         });
+        await _placeMarkerAt(currentLatLng);
+        return;
       }
+      await Future.delayed(_initialLocationRetryDelay);
+    }
+  }
+
+  Future<void> _placeMarkerAt(LatLng location) async {
+    final points = await _mapController.toScreenLocationBatch([location]);
+    if (Platform.isAndroid) {
+      await Future.delayed(const Duration(milliseconds: 20));
+    }
+    if (!mounted || points.isEmpty) return;
+    setState(() {
+      _location = location;
+      _initialPosition = points.first;
     });
   }
 
   @override
   void dispose() {
+    _settleTimer?.cancel();
     _mapController.getPlatform.onCameraIdlePlatform
         .remove(onLocationMarkerListener!);
+    // Was never de-registered before, so every visit to a page using this layer
+    // left another live callback on the platform instance.
+    if (onUserLocationListener != null) {
+      _mapController.getPlatform.onUserLocationUpdatedPlatform
+          .remove(onUserLocationListener!);
+    }
     _mapController.removeListener(onMapListener!);
     super.dispose();
   }
@@ -272,7 +351,10 @@ class _UserLocationLayerState extends State<UserLocationLayer> {
 
   @override
   Widget build(BuildContext context) {
-    return _location != null && _initialPosition != null
+    return _hasFix &&
+            _mapSettled &&
+            _location != null &&
+            _initialPosition != null
         ? MarkerWidget(
             key: 'vietmapLocationMarker2024',
             coordinate: _location!,
